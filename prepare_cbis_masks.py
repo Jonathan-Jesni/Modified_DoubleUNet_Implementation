@@ -106,33 +106,44 @@ def process_split(split: str):
         print(f"[ERROR] Missing annotation folder: {ann_dir}")
         return
 
+    image_files = sorted(img_dir.glob("*.png"))
     json_files = sorted(ann_dir.glob("*.json"))
 
+    image_map = {p.name: p for p in image_files}
+    ann_map = {p.name.replace(".json", ""): p for p in json_files}
+
+    common_names = sorted(set(image_map.keys()) & set(ann_map.keys()))
+    ann_without_img = sorted(set(ann_map.keys()) - set(image_map.keys()))
+    img_without_ann = sorted(set(image_map.keys()) - set(ann_map.keys()))
+
     print(f"\nProcessing split: {split}")
-    print(f"Images folder: {img_dir}")
-    print(f"Annotations: {len(json_files)}")
+    print(f"Images found        : {len(image_files)}")
+    print(f"Annotations found   : {len(json_files)}")
+    print(f"Matched pairs       : {len(common_names)}")
+    print(f"Ann without image   : {len(ann_without_img)}")
+    print(f"Img without ann     : {len(img_without_ann)}")
+
+    if ann_without_img[:10]:
+        print("\nFirst 10 annotations without matching image:")
+        for name in ann_without_img[:10]:
+            print("  ", name)
 
     ok = 0
-    missing_img = 0
     unreadable = 0
+    failed_mask = 0
 
-    for json_path in json_files:
-        image_name = json_path.name.replace(".json", "")
-        image_path = img_dir / image_name
-
-        if not image_path.exists():
-            print(f"[WARN] Missing image: {image_name}")
-            missing_img += 1
-            continue
+    for image_name in common_names:
+        image_path = image_map[image_name]
+        json_path = ann_map[image_name]
 
         try:
             mask = build_full_mask(json_path)
         except Exception as e:
             print(f"[WARN] Failed mask build: {json_path.name} | {e}")
+            failed_mask += 1
             continue
 
         img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
-
         if img is None:
             print(f"[WARN] Could not read image: {image_path}")
             unreadable += 1
@@ -145,14 +156,13 @@ def process_split(split: str):
         cv2.imwrite(str(out_mask_path), mask)
 
         ok += 1
-
         if ok % 100 == 0:
             print(f"Saved {ok} samples...")
 
     print(f"\nDone {split}")
-    print(f"Saved       : {ok}")
-    print(f"Missing img : {missing_img}")
-    print(f"Unreadable  : {unreadable}")
+    print(f"Saved        : {ok}")
+    print(f"Unreadable   : {unreadable}")
+    print(f"Failed masks : {failed_mask}")
 
 
 def main():
