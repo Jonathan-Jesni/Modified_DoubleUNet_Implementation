@@ -75,10 +75,9 @@ results/
 # ==================================================
 # Dataset Files (large local data)
 # ==================================================
-data/
 dataset_seg/
-dataset/
-Task03_Liver/
+CBIS_dataset/
+BUSI_dataset/
 images/
 masks/
 
