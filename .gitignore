@@ -76,7 +76,7 @@ results/
 # Dataset Files (large local data)
 # ==================================================
 data/
-datasets/
+dataset_seg/
 dataset/
 Task03_Liver/
 images/
