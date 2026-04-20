@@ -288,7 +288,7 @@ if __name__ == "__main__":
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", patience=5, verbose=True
+        optimizer, mode="min", patience=5
     )
     loss_fn = DiceBCELoss()
     loss_name = "BCE + Dice Loss"
