@@ -52,50 +52,37 @@ def otsu_mask(image, size):
     return th
 
 def calculate_metrics(y_true, y_pred, num_classes=3):
-    if not torch.is_tensor(y_true):
-        y_true = torch.tensor(y_true, device=y_pred.device if torch.is_tensor(y_pred) else 'cpu')
-    if not torch.is_tensor(y_pred):
-        y_pred = torch.tensor(y_pred, device=y_true.device)
+    # ... (existing tensor conversion and flattening code) ...
 
-    y_true = y_true.view(-1)
-    y_pred = y_pred.view(-1)
-        
-    jaccard_scores = []
-    f1_scores = []
-    recall_scores = []
-    precision_scores = []
-    
+    jaccard_scores, f1_scores, recall_scores, precision_scores = [], [], [], []
     epsilon = 1e-15
     
     for c in range(num_classes):
         true_c = (y_true == c)
         pred_c = (y_pred == c)
         
-        # --- THE MISSING CLASS FIX ---
-        if true_c.sum() == 0 and pred_c.sum() == 0:
-            # If class is entirely absent in both target and prediction, it's a perfect match
-            jaccard = torch.tensor(1.0, device=y_true.device)
-            precision = torch.tensor(1.0, device=y_true.device)
-            recall = torch.tensor(1.0, device=y_true.device)
-            f1 = torch.tensor(1.0, device=y_true.device)
-        else:
-            tp = (true_c & pred_c).sum().float()
-            fp = (~true_c & pred_c).sum().float()
-            fn = (true_c & ~pred_c).sum().float()
+        # If the class is not in the ground truth, skip it for this image
+        if true_c.sum() == 0:
+            continue 
             
-            jaccard = tp / (tp + fp + fn + epsilon)
-            precision = tp / (tp + fp + epsilon)
-            recall = tp / (tp + fn + epsilon)
-            f1 = 2 * (precision * recall) / (precision + recall + epsilon)
+        tp = (true_c & pred_c).sum().float()
+        fp = (~true_c & pred_c).sum().float()
+        fn = (true_c & ~pred_c).sum().float()
+            
+        jaccard = tp / (tp + fp + fn + epsilon)
+        precision = tp / (tp + fp + epsilon)
+        recall = tp / (tp + fn + epsilon)
+        f1 = 2 * (precision * recall) / (precision + recall + epsilon)
             
         jaccard_scores.append(jaccard)
         f1_scores.append(f1)
         recall_scores.append(recall)
         precision_scores.append(precision)
         
+    # Average only over the classes that actually existed in this sample
     return [
-        torch.stack(jaccard_scores).mean().item(),
-        torch.stack(f1_scores).mean().item(),
-        torch.stack(recall_scores).mean().item(),
-        torch.stack(precision_scores).mean().item()
+        torch.stack(jaccard_scores).mean().item() if jaccard_scores else 0.0,
+        torch.stack(f1_scores).mean().item() if f1_scores else 0.0,
+        torch.stack(recall_scores).mean().item() if recall_scores else 0.0,
+        torch.stack(precision_scores).mean().item() if precision_scores else 0.0
     ]

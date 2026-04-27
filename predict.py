@@ -69,14 +69,12 @@ def load_mask(mask_path, size):
     return mask_bin
 
 
-def tensor_to_prediction(pred_tensor, threshold=0.5):
-    pred_prob = torch.sigmoid(pred_tensor).detach().cpu().numpy()[0, 0]
-    pred_bin = (pred_prob >= threshold).astype(np.uint8)
-
-    pred_prob_u8 = (pred_prob * 255).clip(0, 255).astype(np.uint8)
-    pred_bin_u8 = (pred_bin * 255).astype(np.uint8)
-
-    return pred_prob, pred_bin, pred_prob_u8, pred_bin_u8
+def tensor_to_prediction(pred_tensor):
+    # Use Softmax because model output is multi-class logits
+    prob = torch.softmax(pred_tensor, dim=1).detach().cpu().numpy()[0] 
+    # Get discrete class indices (0, 1, or 2)
+    pred_classes = np.argmax(prob, axis=0).astype(np.uint8)
+    return prob, pred_classes
 
 
 def compute_metrics(y_true, y_pred):
@@ -112,12 +110,17 @@ def compute_metrics(y_true, y_pred):
     }
 
 
-def colorize_mask(mask_bin_u8):
+def colorize_mask(mask_classes):
     """
-    Binary mask 0/255 -> BGR visualization
+    BGR Color Mapping:
+    Class 0 (Background): Black [0, 0, 0]
+    Class 1 (Benign): Green [0, 255, 0]
+    Class 2 (Malignant): Red [0, 0, 255]
     """
-    color = np.zeros((mask_bin_u8.shape[0], mask_bin_u8.shape[1], 3), dtype=np.uint8)
-    color[mask_bin_u8 > 0] = (0, 255, 0)  # green
+    h, w = mask_classes.shape
+    color = np.zeros((h, w, 3), dtype=np.uint8)
+    color[mask_classes == 1] = (0, 255, 0) 
+    color[mask_classes == 2] = (0, 0, 255) 
     return color
 
 
@@ -213,98 +216,109 @@ def main():
 
     print("[INFO] Loading model...")
     model = build_doubleunet()
+    # Ensure this matches your multiclass checkpoint (3 output channels)
     model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
     model = model.to(device)
     model.eval()
 
     image_paths = sorted(glob(os.path.join(IMAGE_DIR, "*.png")))
     if len(image_paths) == 0:
+        # Fallback for .jpg if your test set uses them
+        image_paths = sorted(glob(os.path.join(IMAGE_DIR, "*.jpg")))
+        
+    if len(image_paths) == 0:
         raise FileNotFoundError(f"No images found in: {IMAGE_DIR}")
 
     print(f"[INFO] Found {len(image_paths)} test images")
 
     all_rows = []
-    dice_scores = []
-    iou_scores = []
-    recall_scores = []
-    precision_scores = []
-    accuracy_scores = []
+    # Using lists to track multi-class averages
+    summary_metrics = {"jaccard": [], "f1": [], "recall": [], "precision": []}
 
     with torch.no_grad():
         for idx, image_path in enumerate(image_paths, start=1):
             name = os.path.basename(image_path)
-            mask_path = os.path.join(MASK_DIR, name)
+            # Find matching mask (usually .png)
+            mask_name = os.path.splitext(name)[0] + "_mask.png"
+            mask_path = os.path.join(MASK_DIR, mask_name)
 
             if not os.path.exists(mask_path):
                 print(f"[WARNING] Mask not found for {name}, skipping")
                 continue
 
-            # Load image and mask
+            # 1. Load image and mask
             original_gray, image_resized_rgb, image_tensor = load_image(image_path, IMAGE_SIZE)
             image_tensor = image_tensor.to(device)
-
-            gt_bin = load_mask(mask_path, IMAGE_SIZE)
+            
+            # Load GT and map to 0, 1, 2
+            mask_raw = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            mask_raw = cv2.resize(mask_raw, IMAGE_SIZE, interpolation=cv2.INTER_NEAREST)
+            gt_classes = np.zeros(mask_raw.shape, dtype=np.int64)
+            tumor_pixels = (mask_raw > 127)
+            
+            if "benign" in name.lower():
+                gt_classes[tumor_pixels] = 1
+            elif "malignant" in name.lower():
+                gt_classes[tumor_pixels] = 2
+            # "normal" stays 0
 
             image_gray_resized = cv2.resize(original_gray, IMAGE_SIZE, interpolation=cv2.INTER_LINEAR)
 
-            # Model prediction
+            # 2. Model prediction
             p1, p2 = model(image_tensor)
 
-            # Final output from p2
-            _, pred_bin, prob_u8, pred_bin_u8 = tensor_to_prediction(p2, threshold=THRESHOLD)
+            # 3. Multi-class conversion using Softmax + Argmax
+            prob_map, pred_classes = tensor_to_prediction(p2) 
+            
+            # 4. Metrics using updated multi-class logic
+            # Convert to tensors for calculate_metrics
+            m_jaccard, m_f1, m_recall, m_precision = calculate_metrics(
+                torch.from_numpy(gt_classes).to(device), 
+                torch.from_numpy(pred_classes).to(device)
+            )
 
-            # Optional save p1 too
-            if USE_P1_TOO:
-                _, pred_bin_p1, prob_u8_p1, pred_bin_u8_p1 = tensor_to_prediction(p1, threshold=THRESHOLD)
-                cv2.imwrite(os.path.join(OUTPUT_DIR, "pred_masks_p1", name), pred_bin_u8_p1)
-                cv2.imwrite(os.path.join(OUTPUT_DIR, "prob_maps_p1", name), prob_u8_p1)
-
-            # Metrics
-            metrics = compute_metrics(gt_bin, pred_bin)
-
-            # Save outputs
+            # 5. Save Visuals
+            # pred_bin_u8 scaled for visibility (0, 127, 254)
+            pred_bin_u8 = (pred_classes * 127).astype(np.uint8)
             cv2.imwrite(os.path.join(MASK_OUTPUT_DIR, name), pred_bin_u8)
-            cv2.imwrite(os.path.join(PROB_OUTPUT_DIR, name), prob_u8)
+            
+            # Prob map: use the channel with the highest non-background probability for visualization
+            prob_vis = (np.max(prob_map[1:], axis=0) * 255).astype(np.uint8)
+            cv2.imwrite(os.path.join(PROB_OUTPUT_DIR, name), prob_vis)
 
-            overlay = make_overlay(image_gray_resized, pred_bin_u8)
+            overlay = make_overlay(image_gray_resized, pred_classes) # Updated for multi-color
             cv2.imwrite(os.path.join(OVERLAY_OUTPUT_DIR, name), overlay)
 
+            # Prepare metrics dict for the panel
+            panel_metrics = {"dice": m_f1, "iou": m_jaccard}
             panel = make_panel(
                 image_gray_resized=image_gray_resized,
-                gt_bin=gt_bin,
-                prob_u8=prob_u8,
-                pred_bin_u8=pred_bin_u8,
-                metrics=metrics,
+                gt_bin=gt_classes,
+                prob_u8=prob_vis,
+                pred_bin_u8=pred_classes,
+                metrics=panel_metrics,
                 name=name
             )
             cv2.imwrite(os.path.join(PANEL_OUTPUT_DIR, name), panel)
 
+            # 6. Logging
             row = {
                 "image_name": name,
-                "dice": metrics["dice"],
-                "iou": metrics["iou"],
-                "recall": metrics["recall"],
-                "precision": metrics["precision"],
-                "accuracy": metrics["accuracy"],
-                "tp": metrics["tp"],
-                "tn": metrics["tn"],
-                "fp": metrics["fp"],
-                "fn": metrics["fn"],
+                "jaccard": m_jaccard,
+                "f1_score": m_f1,
+                "recall": m_recall,
+                "precision": m_precision
             }
             all_rows.append(row)
-
-            dice_scores.append(metrics["dice"])
-            iou_scores.append(metrics["iou"])
-            recall_scores.append(metrics["recall"])
-            precision_scores.append(metrics["precision"])
-            accuracy_scores.append(metrics["accuracy"])
+            
+            summary_metrics["jaccard"].append(m_jaccard)
+            summary_metrics["f1"].append(m_f1)
+            summary_metrics["recall"].append(m_recall)
+            summary_metrics["precision"].append(m_precision)
 
             print(
                 f"[{idx:03d}/{len(image_paths):03d}] {name} | "
-                f"Dice: {metrics['dice']:.4f} | "
-                f"IoU: {metrics['iou']:.4f} | "
-                f"Recall: {metrics['recall']:.4f} | "
-                f"Precision: {metrics['precision']:.4f}"
+                f"Jaccard: {m_jaccard:.4f} | F1: {m_f1:.4f}"
             )
 
     # Save CSV
@@ -313,15 +327,13 @@ def main():
     # Print summary
     if len(all_rows) > 0:
         print("\n" + "=" * 60)
-        print("[SUMMARY]")
+        print("[SUMMARY - MULTI-CLASS]")
         print(f"Images evaluated : {len(all_rows)}")
-        print(f"Mean Dice        : {np.mean(dice_scores):.4f}")
-        print(f"Mean IoU         : {np.mean(iou_scores):.4f}")
-        print(f"Mean Recall      : {np.mean(recall_scores):.4f}")
-        print(f"Mean Precision   : {np.mean(precision_scores):.4f}")
-        print(f"Mean Accuracy    : {np.mean(accuracy_scores):.4f}")
+        print(f"Mean Jaccard     : {np.mean(summary_metrics['jaccard']):.4f}")
+        print(f"Mean F1 (Dice)   : {np.mean(summary_metrics['f1']):.4f}")
+        print(f"Mean Recall      : {np.mean(summary_metrics['recall']):.4f}")
+        print(f"Mean Precision   : {np.mean(summary_metrics['precision']):.4f}")
         print(f"CSV saved at     : {CSV_PATH}")
-        print(f"Panels saved at  : {PANEL_OUTPUT_DIR}")
         print("=" * 60)
     else:
         print("[INFO] No images were evaluated.")

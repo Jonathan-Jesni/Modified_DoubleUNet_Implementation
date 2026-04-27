@@ -72,8 +72,7 @@ class DATASET(Dataset):
         self.n_samples = len(images_path)
 
     def __getitem__(self, index):
-            import os 
-            
+                    
             image_path = self.images_path[index]
             mask_path = self.masks_path[index]
 
@@ -105,17 +104,15 @@ class DATASET(Dataset):
             image = image / 255.0                   # Normalize pixels to 0-1
             image = torch.from_numpy(image).float() # Convert to PyTorch Tensor
 
-            # --- MULTI-CLASS PIXEL MAPPING FIX ---
+            # --- MULTI-CLASS PIXEL MAPPING ---
             final_mask = np.zeros(mask.shape, dtype=np.int64)
             filename = os.path.basename(mask_path).lower()
-            
             tumor_pixels = (mask > 127)
-            
+
             if "benign" in filename:
-                final_mask[tumor_pixels] = 1      # Class 1: Benign
+                final_mask[tumor_pixels] = 1 
             elif "malignant" in filename:
-                final_mask[tumor_pixels] = 2      # Class 2: Malignant
-                
+                final_mask[tumor_pixels] = 2
             mask = torch.from_numpy(final_mask).long()
             return image, mask
 
