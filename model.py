@@ -1,7 +1,8 @@
+import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import vgg19
+from torchvision.models import vgg19, densenet121
 
 class Conv2D(nn.Module):
     def __init__(self, in_c, out_c, kernel_size=3, padding=1, dilation=1, bias=False, act=True):
@@ -94,22 +95,44 @@ class encoder1(nn.Module):
     def __init__(self):
         super().__init__()
 
-        network = vgg19(pretrained=True)
-        # print(network)
+        # 1. Load the pre-trained backbone models
+        vgg = vgg19(weights='DEFAULT').features
+        densenet = densenet121(weights='DEFAULT').features
+        self.xception = timm.create_model('legacy_xception', pretrained=True, features_only=True)
 
-        self.x1 = network.features[:4]
-        self.x2 = network.features[4:9]
-        self.x3 = network.features[9:18]
-        self.x4 = network.features[18:27]
-        self.x5 = network.features[27:36]
+        # 2. Assign the blocks
+        # Start at index 4 (denseblock1) to bypass the 3-channel image input layer.
+        self.dense_block2 = nn.Sequential(*list(densenet.children())[4:6]) 
+        self.dense_block3 = nn.Sequential(*list(densenet.children())[6:8]) 
+        
+        # VGG blocks 4 and 5 
+        self.vgg_block4 = vgg[18:27]
+        self.vgg_block5 = vgg[27:36]
+
+        # 3. Projection to handle Xception's 64-channel output
+        self.proj1 = nn.Conv2d(64, 64, kernel_size=1)
 
     def forward(self, x):
-        x0 = x
-        x1 = self.x1(x0)
-        x2 = self.x2(x1)
-        x3 = self.x3(x2)
-        x4 = self.x4(x3)
-        x5 = self.x5(x4)
+        # Block 1: Xception
+        xcept_features = self.xception(x)
+        x1_raw = xcept_features[0] 
+        x1 = self.proj1(x1_raw)
+        
+        # Force Block 1 to the canonical 256x256 for the first skip connection
+        x1 = F.interpolate(x1, size=(256, 256), mode='bilinear', align_corners=False)
+
+        # Block 2: DenseNet (naturally pools 256x256 to 128x128)
+        x2 = self.dense_block2(x1)
+
+        # Block 3: DenseNet (naturally pools 128x128 to 64x64)
+        x3 = self.dense_block3(x2)
+
+        # Block 4: VGG-19 (naturally pools 64x64 to 32x32)
+        x4 = self.vgg_block4(x3)
+
+        # Block 5: VGG-19 (naturally pools 32x32 to 16x16)
+        x5 = self.vgg_block5(x4)
+
         return x5, [x4, x3, x2, x1]
 
 class decoder1(nn.Module):
@@ -204,17 +227,20 @@ class decoder2(nn.Module):
 class build_doubleunet(nn.Module):
     def __init__(self):
         super().__init__()
-
         self.e1 = encoder1()
         self.a1 = ASPP(512, 64)
         self.d1 = decoder1()
-        self.y1 = nn.Conv2d(32, 1, kernel_size=1, padding=0)
-        self.sigmoid = nn.Sigmoid()
+        
+        # --- MODIFIED FOR MULTI-CLASS ---
+        # Change 1 channel to 3 channels, and remove self.sigmoid
+        self.y1 = nn.Conv2d(32, 3, kernel_size=1, padding=0) 
 
         self.e2 = encoder2()
         self.a2 = ASPP(256, 64)
         self.d2 = decoder2()
-        self.y2 = nn.Conv2d(32, 1, kernel_size=1, padding=0)
+        
+        # Change 1 channel to 3 channels
+        self.y2 = nn.Conv2d(32, 3, kernel_size=1, padding=0)
 
     def forward(self, x):
         x0 = x
@@ -223,8 +249,14 @@ class build_doubleunet(nn.Module):
         x = self.d1(x, skip1)
         y1 = self.y1(x)
 
-        input_x = x0 * self.sigmoid(y1)
+        # --- MODIFIED FOR MULTI-CLASS ---
+        # Replaced binary sigmoid with multi-class Softmax attention
+        prob_y1 = torch.softmax(y1, dim=1)
+        foreground_attention = prob_y1[:, 1:, :, :].sum(dim=1, keepdim=True)
+        
+        input_x = x0 * foreground_attention # Apply attention
         x, skip2 = self.e2(input_x)
+        
         x = self.a2(x)
         x = self.d2(x, skip1, skip2)
         y2 = self.y2(x)

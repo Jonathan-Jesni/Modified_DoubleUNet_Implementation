@@ -6,8 +6,8 @@ import cv2
 from tqdm import tqdm
 import torch
 from sklearn.utils import shuffle
-from metrics import precision, recall, F2, dice_score, jac_score
-from sklearn.metrics import accuracy_score, confusion_matrix
+from sklearn.metrics import confusion_matrix
+from sklearn.metrics import jaccard_score, f1_score, recall_score, precision_score, accuracy_score, fbeta_score
 
 """ Seeding the randomness. """
 def seeding(seed):
@@ -51,24 +51,51 @@ def otsu_mask(image, size):
     th = th.astype(np.int32)
     return th
 
-def calculate_metrics(y_true, y_pred):
-    y_true = y_true.detach().cpu().numpy()
-    y_pred = y_pred.detach().cpu().numpy()
+def calculate_metrics(y_true, y_pred, num_classes=3):
+    if not torch.is_tensor(y_true):
+        y_true = torch.tensor(y_true, device=y_pred.device if torch.is_tensor(y_pred) else 'cpu')
+    if not torch.is_tensor(y_pred):
+        y_pred = torch.tensor(y_pred, device=y_true.device)
 
-    y_pred = y_pred > 0.5
-    y_pred = y_pred.reshape(-1)
-    y_pred = y_pred.astype(np.uint8)
-
-    y_true = y_true > 0.5
-    y_true = y_true.reshape(-1)
-    y_true = y_true.astype(np.uint8)
-
-    ## Score
-    score_jaccard = jac_score(y_true, y_pred)
-    score_f1 = dice_score(y_true, y_pred)
-    score_recall = recall(y_true, y_pred)
-    score_precision = precision(y_true, y_pred)
-    score_fbeta = F2(y_true, y_pred)
-    score_acc = accuracy_score(y_true, y_pred)
-
-    return [score_jaccard, score_f1, score_recall, score_precision, score_acc, score_fbeta]
+    y_true = y_true.view(-1)
+    y_pred = y_pred.view(-1)
+        
+    jaccard_scores = []
+    f1_scores = []
+    recall_scores = []
+    precision_scores = []
+    
+    epsilon = 1e-15
+    
+    for c in range(num_classes):
+        true_c = (y_true == c)
+        pred_c = (y_pred == c)
+        
+        # --- THE MISSING CLASS FIX ---
+        if true_c.sum() == 0 and pred_c.sum() == 0:
+            # If class is entirely absent in both target and prediction, it's a perfect match
+            jaccard = torch.tensor(1.0, device=y_true.device)
+            precision = torch.tensor(1.0, device=y_true.device)
+            recall = torch.tensor(1.0, device=y_true.device)
+            f1 = torch.tensor(1.0, device=y_true.device)
+        else:
+            tp = (true_c & pred_c).sum().float()
+            fp = (~true_c & pred_c).sum().float()
+            fn = (true_c & ~pred_c).sum().float()
+            
+            jaccard = tp / (tp + fp + fn + epsilon)
+            precision = tp / (tp + fp + epsilon)
+            recall = tp / (tp + fn + epsilon)
+            f1 = 2 * (precision * recall) / (precision + recall + epsilon)
+            
+        jaccard_scores.append(jaccard)
+        f1_scores.append(f1)
+        recall_scores.append(recall)
+        precision_scores.append(precision)
+        
+    return [
+        torch.stack(jaccard_scores).mean().item(),
+        torch.stack(f1_scores).mean().item(),
+        torch.stack(recall_scores).mean().item(),
+        torch.stack(precision_scores).mean().item()
+    ]

@@ -3,6 +3,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 """ Loss Functions -------------------------------------- """
+class MultiClassDiceLoss(nn.Module):
+    def __init__(self, num_classes=3, smooth=1e-5):
+        super(MultiClassDiceLoss, self).__init__()
+        self.num_classes = num_classes
+        self.smooth = smooth
+
+    def forward(self, inputs, targets):
+        # 1. Apply Softmax to model outputs to get probabilities
+        inputs = torch.softmax(inputs, dim=1)
+        
+        # 2. PROPER BITMASKING: Convert target (Batch, H, W) to one-hot
+        targets_one_hot = F.one_hot(targets.long(), num_classes=self.num_classes)
+        targets_one_hot = targets_one_hot.permute(0, 3, 1, 2).float()
+
+        # 3. Calculate Dice for each class
+        intersection = (inputs * targets_one_hot).sum(dim=(2, 3))
+        union = inputs.sum(dim=(2, 3)) + targets_one_hot.sum(dim=(2, 3))
+        
+        dice_score = (2. * intersection + self.smooth) / (union + self.smooth)
+        
+        # 4. Average the loss across all classes
+        return 1.0 - dice_score.mean()
+
 class DiceLoss(nn.Module):
     def __init__(self, weight=None, size_average=True):
         super(DiceLoss, self).__init__()
@@ -34,6 +57,19 @@ class DiceBCELoss(nn.Module):
         Dice_BCE = BCE + dice_loss
 
         return Dice_BCE
+
+class CombinedLoss(nn.Module):
+    def __init__(self, num_classes=3, smooth=1e-5):
+        super(CombinedLoss, self).__init__()
+        self.dice = MultiClassDiceLoss(num_classes=num_classes, smooth=smooth)
+        self.ce = nn.CrossEntropyLoss()
+
+    def forward(self, inputs, targets):
+        # inputs: [Batch, Classes, H, W] (Raw Logits)
+        # targets: [Batch, H, W] (Class Indices)
+        ce_loss = self.ce(inputs, targets)
+        dice_loss = self.dice(inputs, targets)
+        return ce_loss + dice_loss
 
 """ Metrics ------------------------------------------ """
 def precision(y_true, y_pred):

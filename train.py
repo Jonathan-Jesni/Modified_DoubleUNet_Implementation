@@ -18,7 +18,7 @@ from utils import (
     calculate_metrics,
 )
 from model import build_doubleunet
-from metrics import DiceBCELoss
+from metrics import DiceBCELoss, MultiClassDiceLoss, CombinedLoss
 
 
 def load_data(path):
@@ -72,41 +72,52 @@ class DATASET(Dataset):
         self.n_samples = len(images_path)
 
     def __getitem__(self, index):
-        image_path = self.images_path[index]
-        mask_path = self.masks_path[index]
+            import os 
+            
+            image_path = self.images_path[index]
+            mask_path = self.masks_path[index]
 
-        # Read grayscale ultrasound image
-        image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-        if image is None:
-            raise ValueError(f"Failed to read image: {image_path}")
+            # Read grayscale ultrasound image
+            image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+            if image is None:
+                raise ValueError(f"Failed to read image: {image_path}")
 
-        # Repeat grayscale into 3 identical channels for pretrained encoder
-        image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+            # Repeat grayscale into 3 identical channels for pretrained encoder
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
 
-        # Read mask as grayscale
-        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            raise ValueError(f"Failed to read mask: {mask_path}")
+            # Read mask as grayscale
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                raise ValueError(f"Failed to read mask: {mask_path}")
 
-        # Resize first
-        image = cv2.resize(image, self.size, interpolation=cv2.INTER_LINEAR)
-        mask = cv2.resize(mask, self.size, interpolation=cv2.INTER_NEAREST)
+            # Resize first
+            image = cv2.resize(image, self.size, interpolation=cv2.INTER_LINEAR)
+            mask = cv2.resize(mask, self.size, interpolation=cv2.INTER_NEAREST)
 
-        # Augment
-        if self.transform is not None:
-            augmented = self.transform(image=image, mask=mask)
-            image = augmented["image"]
-            mask = augmented["mask"]
+            # Augment
+            if self.transform is not None:
+                augmented = self.transform(image=image, mask=mask)
+                image = augmented["image"]
+                mask = augmented["mask"]
 
-        # Normalize image to [0, 1]
-        image = image.astype(np.float32) / 255.0
-        image = np.transpose(image, (2, 0, 1))  # HWC -> CHW
+            # --- PYTORCH IMAGE FORMATTING ---
+            image = np.transpose(image, (2, 0, 1))  # Convert from HWC to CHW
+            image = image / 255.0                   # Normalize pixels to 0-1
+            image = torch.from_numpy(image).float() # Convert to PyTorch Tensor
 
-        # Binarize mask and shape to [1, H, W]
-        mask = (mask > 127).astype(np.float32)
-        mask = np.expand_dims(mask, axis=0)
-
-        return image, mask
+            # --- MULTI-CLASS PIXEL MAPPING FIX ---
+            final_mask = np.zeros(mask.shape, dtype=np.int64)
+            filename = os.path.basename(mask_path).lower()
+            
+            tumor_pixels = (mask > 127)
+            
+            if "benign" in filename:
+                final_mask[tumor_pixels] = 1      # Class 1: Benign
+            elif "malignant" in filename:
+                final_mask[tumor_pixels] = 2      # Class 2: Malignant
+                
+            mask = torch.from_numpy(final_mask).long()
+            return image, mask
 
     def __len__(self):
         return self.n_samples
@@ -121,34 +132,34 @@ def train(model, loader, optimizer, loss_fn, device):
     epoch_recall = 0.0
     epoch_precision = 0.0
 
+    # SPEED PATCH 1: Initialize AMP Scaler
+    scaler = torch.amp.GradScaler('cuda')
+    
     for x, y in loader:
         x = x.to(device, dtype=torch.float32)
-        y = y.to(device, dtype=torch.float32)
-
-        optimizer.zero_grad()
-        p1, p2 = model(x)
-        loss = loss_fn(p1, y) + loss_fn(p2, y)
-        loss.backward()
-        optimizer.step()
+        y = y.to(device, dtype=torch.long)
+        
+        # SPEED PATCH 2: set_to_none=True clears gradients faster
+        optimizer.zero_grad(set_to_none=True)
+        
+        # SPEED PATCH 3: autocast for 16-bit math
+        with torch.amp.autocast('cuda'):
+            p1, p2 = model(x)
+            loss = loss_fn(p1, y) + loss_fn(p2, y)
+            
+        # SPEED PATCH 4: Scaled backward pass
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         epoch_loss += loss.item()
 
-        batch_jac = []
-        batch_f1 = []
-        batch_recall = []
-        batch_precision = []
-
-        for yt, yp in zip(y, p2):
-            score = calculate_metrics(yt, yp)
-            batch_jac.append(score[0])
-            batch_f1.append(score[1])
-            batch_recall.append(score[2])
-            batch_precision.append(score[3])
-
-        epoch_jac += np.mean(batch_jac)
-        epoch_f1 += np.mean(batch_f1)
-        epoch_recall += np.mean(batch_recall)
-        epoch_precision += np.mean(batch_precision)
+        p2_classes = torch.argmax(p2, dim=1)
+        score = calculate_metrics(y, p2_classes)
+        epoch_jac += score[0]
+        epoch_f1 += score[1]
+        epoch_recall += score[2]
+        epoch_precision += score[3]
 
     epoch_loss = epoch_loss / len(loader)
     epoch_jac = epoch_jac / len(loader)
@@ -170,29 +181,21 @@ def evaluate(model, loader, loss_fn, device):
 
     with torch.no_grad():
         for x, y in loader:
-            x = x.to(device, dtype=torch.float32)
-            y = y.to(device, dtype=torch.float32)
-
-            p1, p2 = model(x)
-            loss = loss_fn(p1, y) + loss_fn(p2, y)
+            # SPEED PATCH 5: Autocast for validation phase
+            with torch.amp.autocast('cuda'):
+                x = x.to(device, dtype=torch.float32)
+                y = y.to(device, dtype=torch.long)
+                p1, p2 = model(x)
+                loss = loss_fn(p1, y) + loss_fn(p2, y)
+                
             epoch_loss += loss.item()
 
-            batch_jac = []
-            batch_f1 = []
-            batch_recall = []
-            batch_precision = []
-
-            for yt, yp in zip(y, p2):
-                score = calculate_metrics(yt, yp)
-                batch_jac.append(score[0])
-                batch_f1.append(score[1])
-                batch_recall.append(score[2])
-                batch_precision.append(score[3])
-
-            epoch_jac += np.mean(batch_jac)
-            epoch_f1 += np.mean(batch_f1)
-            epoch_recall += np.mean(batch_recall)
-            epoch_precision += np.mean(batch_precision)
+            p2_classes = torch.argmax(p2, dim=1)
+            score = calculate_metrics(y, p2_classes)
+            epoch_jac += score[0]
+            epoch_f1 += score[1]
+            epoch_recall += score[2]
+            epoch_precision += score[3]
 
     epoch_loss = epoch_loss / len(loader)
     epoch_jac = epoch_jac / len(loader)
@@ -224,7 +227,7 @@ if __name__ == "__main__":
     # Hyperparameters
     image_size = 256
     size = (image_size, image_size)
-    batch_size = 8
+    batch_size = 8 # SPEED PATCH 6: Increased batch size
     num_epochs = 300
     lr = 1e-4
     early_stopping_patience = 50
@@ -252,9 +255,9 @@ if __name__ == "__main__":
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.2),
         A.CoarseDropout(
-            max_holes=8,
-            max_height=24,
-            max_width=24,
+            num_holes_range=(1, 8),
+            hole_height_range=(1, 24),
+            hole_width_range=(1, 24),
             p=0.2
         ),
     ])
@@ -263,35 +266,48 @@ if __name__ == "__main__":
     train_dataset = DATASET(train_x, train_y, size, transform=transform)
     valid_dataset = DATASET(valid_x, valid_y, size, transform=None)
 
+    # SPEED PATCH 7: Set num_workers=4 and persistent_workers=True
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,
-        pin_memory=torch.cuda.is_available()
+        num_workers=4,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=True 
     )
 
     valid_loader = DataLoader(
         dataset=valid_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
-        pin_memory=torch.cuda.is_available()
+        num_workers=4,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=True 
     )
 
     # Model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # SPEED PATCH 8: cuDNN Benchmarking
+    torch.backends.cudnn.benchmark = True 
+    
     print_and_save(train_log_path, f"Device: {device}\n")
 
     model = build_doubleunet()
     model = model.to(device)
+    
+    # RESUME LOGIC (Already working perfectly)
+    if os.path.exists(checkpoint_path):
+        print(f"--- Found existing checkpoint. Resuming from {checkpoint_path} ---")
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", patience=5
     )
-    loss_fn = DiceBCELoss()
-    loss_name = "BCE + Dice Loss"
+    
+    loss_fn = CombinedLoss(num_classes=3)
+    loss_name = "CrossEntropy + Multi-Class Dice Loss"
 
     data_str = f"Optimizer: Adam\nLoss: {loss_name}\n"
     print_and_save(train_log_path, data_str)
