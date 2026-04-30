@@ -7,7 +7,7 @@ from sklearn.model_selection import train_test_split
 
 ROOT = Path(__file__).resolve().parent
 BUSI_ROOT = ROOT / "BUSI_dataset"
-OUT_ROOT = ROOT / "dataset_seg"
+OUT_ROOT = ROOT / "dataset_seg_BUSI"
 
 CLASSES_TO_USE = ["benign", "malignant"]   # add "normal" later if needed
 RANDOM_STATE = 42

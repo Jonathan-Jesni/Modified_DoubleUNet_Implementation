@@ -10,7 +10,7 @@ from sklearn.model_selection import train_test_split
 
 ROOT = Path(__file__).resolve().parent
 CBIS_ROOT = ROOT / "CBIS_dataset"
-OUT_ROOT = ROOT / "dataset_seg"
+OUT_ROOT = ROOT / "dataset_seg_CBIS"
 
 RANDOM_STATE = 42
 
