@@ -6,7 +6,7 @@ from glob import glob
 import cv2
 from tqdm import tqdm
 import torch
-from model import build_doubleunet
+from BUSI_model import build_doubleunet
 from utils import create_dir, seeding, calculate_metrics
 from train_BUSI import load_data
 

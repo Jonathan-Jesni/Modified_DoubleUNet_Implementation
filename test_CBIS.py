@@ -2,28 +2,40 @@ import os
 import time
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
-from operator import add
 from glob import glob
+from operator import add
 
 import cv2
 import numpy as np
 import torch
 from tqdm import tqdm
 
-from model import build_doubleunet
-from utils import create_dir, seeding, calculate_metrics
+from CBIS_model import build_doubleunet
+from utils import create_dir, seeding
+
+
+NUM_CLASSES = 3
+SIZE = (256, 256)
+DATASET_PATH = "dataset_seg"
+CHECKPOINT_PATH = "files/checkpoint.pth"
+SAVE_PATH = "results_CBIS"
 
 
 def load_data(path):
     def get_split_data(split_name):
-        images = sorted(glob(os.path.join(path, split_name, "images", "*.png")))
-        masks = sorted(glob(os.path.join(path, split_name, "masks", "*.png")))
+        img_dir = os.path.join(path, split_name, "images")
+        mask_dir = os.path.join(path, split_name, "masks")
 
-        if len(images) == 0:
-            images = sorted(glob(os.path.join(path, split_name, "images", "*.jpg")))
+        images = sorted(glob(os.path.join(img_dir, "*.png")))
+        masks = sorted(glob(os.path.join(mask_dir, "*.png")))
 
-        if len(images) == 0:
-            images = sorted(glob(os.path.join(path, split_name, "images", "*.jpeg")))
+        image_dict = {os.path.basename(x): x for x in images}
+        mask_dict = {os.path.basename(y): y for y in masks}
+
+        common_names = sorted(set(image_dict.keys()) & set(mask_dict.keys()))
+
+        images = [image_dict[name] for name in common_names]
+        masks = [mask_dict[name] for name in common_names]
 
         return images, masks
 
@@ -31,30 +43,72 @@ def load_data(path):
     valid_x, valid_y = get_split_data("val")
     test_x, test_y = get_split_data("test")
 
-    if len(test_x) != len(test_y):
-        raise ValueError(f"Test images/masks mismatch: {len(test_x)} images vs {len(test_y)} masks")
-
     return [(train_x, train_y), (valid_x, valid_y), (test_x, test_y)]
 
 
-def process_mask(y_pred_classes):
-    y_pred = y_pred_classes[0].detach().cpu().numpy()
-    y_pred = (y_pred * 127).astype(np.uint8)
+def calculate_multiclass_metrics(y_true, y_pred, num_classes=3):
+    """
+    Macro metrics over foreground classes only:
+      class 1 = benign
+      class 2 = malignant
 
-    y_pred = np.expand_dims(y_pred, axis=-1)
-    y_pred = np.concatenate([y_pred, y_pred, y_pred], axis=2)
+    Background is excluded from averaged score.
+    """
+    y_true = y_true.detach().cpu().numpy().astype(np.uint8)
+    y_pred = y_pred.detach().cpu().numpy().astype(np.uint8)
 
-    return y_pred
+    jaccards = []
+    dices = []
+    recalls = []
+    precisions = []
+
+    for cls in range(1, num_classes):
+        true_cls = (y_true == cls)
+        pred_cls = (y_pred == cls)
+
+        tp = np.logical_and(true_cls, pred_cls).sum()
+        fp = np.logical_and(~true_cls, pred_cls).sum()
+        fn = np.logical_and(true_cls, ~pred_cls).sum()
+
+        if true_cls.sum() == 0 and pred_cls.sum() == 0:
+            continue
+
+        jaccard = tp / (tp + fp + fn + 1e-7)
+        dice = (2 * tp) / (2 * tp + fp + fn + 1e-7)
+        recall = tp / (tp + fn + 1e-7)
+        precision = tp / (tp + fp + 1e-7)
+
+        jaccards.append(jaccard)
+        dices.append(dice)
+        recalls.append(recall)
+        precisions.append(precision)
+
+    if len(jaccards) == 0:
+        return [0.0, 0.0, 0.0, 0.0]
+
+    return [
+        float(np.mean(jaccards)),
+        float(np.mean(dices)),
+        float(np.mean(recalls)),
+        float(np.mean(precisions)),
+    ]
 
 
 def colorize_mask(mask_classes):
     h, w = mask_classes.shape
     color = np.zeros((h, w, 3), dtype=np.uint8)
 
-    color[mask_classes == 1] = (0, 255, 0)   # benign = green
-    color[mask_classes == 2] = (0, 0, 255)   # malignant = red
+    color[mask_classes == 1] = (0, 255, 0)      # benign = green
+    color[mask_classes == 2] = (0, 0, 255)      # malignant = red
 
     return color
+
+
+def gray_mask(mask_classes):
+    out = (mask_classes * 127).astype(np.uint8)
+    out = np.expand_dims(out, axis=-1)
+    out = np.concatenate([out, out, out], axis=2)
+    return out
 
 
 def make_overlay(image_rgb, mask_classes, alpha=0.45):
@@ -62,6 +116,7 @@ def make_overlay(image_rgb, mask_classes, alpha=0.45):
     overlay = image_rgb.copy()
 
     lesion = mask_classes > 0
+
     overlay[lesion] = (
         image_rgb[lesion].astype(np.float32) * (1 - alpha)
         + mask_color[lesion].astype(np.float32) * alpha
@@ -78,7 +133,7 @@ def print_score(metrics_score, num_samples):
 
     print(
         f"Jaccard: {jaccard:1.4f} - "
-        f"F1: {f1:1.4f} - "
+        f"F1/Dice: {f1:1.4f} - "
         f"Recall: {recall:1.4f} - "
         f"Precision: {precision:1.4f}"
     )
@@ -96,8 +151,8 @@ def evaluate(model, save_path, test_x, test_y, size, device):
         if image_gray is None:
             raise ValueError(f"Failed to read image: {x}")
 
+        image_gray = cv2.resize(image_gray, size, interpolation=cv2.INTER_LINEAR)
         image_rgb = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2RGB)
-        image_rgb = cv2.resize(image_rgb, size, interpolation=cv2.INTER_LINEAR)
         save_img = image_rgb.copy()
 
         image = image_rgb.astype(np.float32) / 255.0
@@ -111,16 +166,9 @@ def evaluate(model, save_path, test_x, test_y, size, device):
             raise ValueError(f"Failed to read mask: {y}")
 
         mask_raw = cv2.resize(mask_raw, size, interpolation=cv2.INTER_NEAREST)
-        final_mask = np.clip(mask_raw, 0, 2).astype(np.int64)
+        final_mask = np.clip(mask_raw, 0, 2).astype(np.uint8)
 
-        save_mask_gray = (final_mask * 127).astype(np.uint8)
-        save_mask_gray = np.expand_dims(save_mask_gray, axis=-1)
-        save_mask_gray = np.concatenate([save_mask_gray, save_mask_gray, save_mask_gray], axis=2)
-
-        save_mask_color = colorize_mask(final_mask)
-        gt_overlay = make_overlay(save_img, final_mask)
-
-        mask = torch.from_numpy(final_mask).long().unsqueeze(0).to(device)
+        mask = torch.from_numpy(final_mask).long().to(device)
 
         with torch.no_grad():
             start_time = time.time()
@@ -128,35 +176,33 @@ def evaluate(model, save_path, test_x, test_y, size, device):
             end_time = time.time() - start_time
             time_taken.append(end_time)
 
-            y_pred1_prob = torch.softmax(y_pred1, dim=1)
-            y_pred2_prob = torch.softmax(y_pred2, dim=1)
+            y_pred1_classes = torch.argmax(torch.softmax(y_pred1, dim=1), dim=1)[0]
+            y_pred2_classes = torch.argmax(torch.softmax(y_pred2, dim=1), dim=1)[0]
 
-            y_pred1_classes = torch.argmax(y_pred1_prob, dim=1)
-            y_pred2_classes = torch.argmax(y_pred2_prob, dim=1)
+            score_1 = calculate_multiclass_metrics(mask, y_pred1_classes, NUM_CLASSES)
+            score_2 = calculate_multiclass_metrics(mask, y_pred2_classes, NUM_CLASSES)
 
-            mask_flat = mask.squeeze(0)
-
-            score_1 = calculate_metrics(mask_flat, y_pred1_classes)
             metrics_score_1 = list(map(add, metrics_score_1, score_1))
-
-            score_2 = calculate_metrics(mask_flat, y_pred2_classes)
             metrics_score_2 = list(map(add, metrics_score_2, score_2))
 
-            y_pred1_img = process_mask(y_pred1_classes)
-            y_pred2_img = process_mask(y_pred2_classes)
+            y_pred1_np = y_pred1_classes.detach().cpu().numpy().astype(np.uint8)
+            y_pred2_np = y_pred2_classes.detach().cpu().numpy().astype(np.uint8)
 
-            y_pred1_np = y_pred1_classes[0].detach().cpu().numpy()
-            y_pred2_np = y_pred2_classes[0].detach().cpu().numpy()
+        save_mask_gray = gray_mask(final_mask)
+        y_pred1_gray = gray_mask(y_pred1_np)
+        y_pred2_gray = gray_mask(y_pred2_np)
 
-            y_pred1_color = colorize_mask(y_pred1_np)
-            y_pred2_color = colorize_mask(y_pred2_np)
+        save_mask_color = colorize_mask(final_mask)
+        y_pred1_color = colorize_mask(y_pred1_np)
+        y_pred2_color = colorize_mask(y_pred2_np)
 
-            pred_overlay = make_overlay(save_img, y_pred2_np)
+        gt_overlay = make_overlay(save_img, final_mask)
+        pred_overlay = make_overlay(save_img, y_pred2_np)
 
         line = np.ones((size[1], 10, 3), dtype=np.uint8) * 255
 
         joint_gray = np.concatenate(
-            [save_img, line, save_mask_gray, line, y_pred1_img, line, y_pred2_img],
+            [save_img, line, save_mask_gray, line, y_pred1_gray, line, y_pred2_gray],
             axis=1
         )
 
@@ -177,21 +223,21 @@ def evaluate(model, save_path, test_x, test_y, size, device):
         cv2.imwrite(f"{save_path}/gt_overlay/{name}", gt_overlay)
         cv2.imwrite(f"{save_path}/pred_overlay/{name}", pred_overlay)
 
-        cv2.imwrite(f"{save_path}/mask1/{name}", y_pred1_img)
-        cv2.imwrite(f"{save_path}/mask2/{name}", y_pred2_img)
+        cv2.imwrite(f"{save_path}/mask1/{name}", y_pred1_gray)
+        cv2.imwrite(f"{save_path}/mask2/{name}", y_pred2_gray)
         cv2.imwrite(f"{save_path}/mask1_color/{name}", y_pred1_color)
         cv2.imwrite(f"{save_path}/mask2_color/{name}", y_pred2_color)
 
     print("--- Output 1 Scores ---")
     print_score(metrics_score_1, len(test_x))
 
-    print("--- Output 2 Scores (Final Output) ---")
+    print("--- Output 2 Scores / Final Output ---")
     print_score(metrics_score_2, len(test_x))
 
     mean_time_taken = np.mean(time_taken)
     mean_fps = 1 / mean_time_taken
 
-    print("Mean FPS:", mean_fps)
+    print(f"Mean FPS: {mean_fps:1.2f}")
 
 
 if __name__ == "__main__":
@@ -203,20 +249,21 @@ if __name__ == "__main__":
     model = build_doubleunet()
     model = model.to(device)
 
-    checkpoint_path = "files/checkpoint.pth"
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    if not os.path.exists(CHECKPOINT_PATH):
+        raise FileNotFoundError(f"Checkpoint not found: {CHECKPOINT_PATH}")
 
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
     model.eval()
 
-    path = "dataset_seg"
-    (train_x, train_y), (valid_x, valid_y), (test_x, test_y) = load_data(path)
+    (train_x, train_y), (valid_x, valid_y), (test_x, test_y) = load_data(DATASET_PATH)
 
-    print(f"Test images: {len(test_x)}")
-    print(f"Test masks : {len(test_y)}")
+    print(f"Train images: {len(train_x)}")
+    print(f"Val images  : {len(valid_x)}")
+    print(f"Test images : {len(test_x)}")
+    print(f"Test masks  : {len(test_y)}")
 
-    save_path = "results_CBIS"
+    if len(test_x) == 0:
+        raise RuntimeError("No test images found. Run CBIS_prepare.py first.")
 
     for item in [
         "mask1",
@@ -229,7 +276,6 @@ if __name__ == "__main__":
         "gt_overlay",
         "pred_overlay",
     ]:
-        create_dir(f"{save_path}/{item}")
+        create_dir(f"{SAVE_PATH}/{item}")
 
-    size = (256, 256)
-    evaluate(model, save_path, test_x, test_y, size, device)
+    evaluate(model, SAVE_PATH, test_x, test_y, SIZE, device)

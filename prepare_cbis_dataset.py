@@ -1,310 +1,265 @@
 from pathlib import Path
-import shutil
+import json
+import base64
+import zlib
+
 import cv2
 import numpy as np
-import pandas as pd
 from sklearn.model_selection import train_test_split
 
 
 ROOT = Path(__file__).resolve().parent
 CBIS_ROOT = ROOT / "CBIS_dataset"
-CSV_ROOT = CBIS_ROOT / "csv"
-JPEG_ROOT = CBIS_ROOT / "jpeg"
 OUT_ROOT = ROOT / "dataset_seg"
 
 RANDOM_STATE = 42
 
-CLASS_MAP = {
-    "BENIGN": 1,
-    "BENIGN_WITHOUT_CALLBACK": 1,
-    "MALIGNANT": 2,
-}
+# Mask classes:
+# 0 = background
+# 1 = benign/default lesion
+# 2 = malignant
 
 
 def ensure_dir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
 
 
-def clean_output():
-    if OUT_ROOT.exists():
-        shutil.rmtree(OUT_ROOT)
-
-    for split in ["train", "val", "test"]:
-        ensure_dir(OUT_ROOT / split / "images")
-        ensure_dir(OUT_ROOT / split / "masks")          # grayscale 0/1/2 for training
-        ensure_dir(OUT_ROOT / split / "masks_color")    # colored copy for viewing
+def get_ann_path(split_dir: Path, image_path: Path):
+    return split_dir / "ann" / f"{image_path.name}.json"
 
 
+def infer_class_id(ann_data, ann_path: Path):
+    tag_names = []
+
+    for tag in ann_data.get("tags", []):
+        tag_names.append(str(tag.get("name", "")).lower())
+        tag_names.append(str(tag.get("value", "")).lower())
+
+    text = " ".join(tag_names).lower()
+
+    if "malignant" in text:
+        return 2
+
+    if "benign" in text:
+        return 1
+
+    print(f"[WARN] No benign/malignant tag found in: {ann_path.name}. Using class 1.")
+    return 1
+
+
+def decode_bitmap(bitmap_obj):
+    encoded = bitmap_obj.get("data", "")
+    origin = bitmap_obj.get("origin", [0, 0])
+
+    decoded = base64.b64decode(encoded)
+    decompressed = zlib.decompress(decoded)
+
+    arr = np.frombuffer(decompressed, dtype=np.uint8)
+    bitmap_img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+
+    if bitmap_img is None:
+        return None, origin
+
+    if len(bitmap_img.shape) == 3:
+        if bitmap_img.shape[2] == 4:
+            bitmap_mask = bitmap_img[:, :, 3]
+        else:
+            bitmap_mask = cv2.cvtColor(bitmap_img, cv2.COLOR_BGR2GRAY)
+    else:
+        bitmap_mask = bitmap_img
+
+    bitmap_mask = (bitmap_mask > 0).astype(np.uint8)
+
+    return bitmap_mask, origin
+
+
+def draw_polygon(mask, points, class_id, scale_x, scale_y):
+    exterior = points.get("exterior", [])
+
+    if len(exterior) < 3:
+        return
+
+    pts = np.array(
+        [[int(x * scale_x), int(y * scale_y)] for x, y in exterior],
+        dtype=np.int32
+    )
+
+    cv2.fillPoly(mask, [pts], class_id)
+
+    for interior in points.get("interior", []):
+        if len(interior) < 3:
+            continue
+
+        hole = np.array(
+            [[int(x * scale_x), int(y * scale_y)] for x, y in interior],
+            dtype=np.int32
+        )
+
+        cv2.fillPoly(mask, [hole], 0)
+
+
+def build_mask_from_json(ann_path: Path, image_shape):
+    h, w = image_shape[:2]
+
+    with open(ann_path, "r", encoding="utf-8") as f:
+        ann_data = json.load(f)
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    class_id = infer_class_id(ann_data, ann_path)
+
+    objects = ann_data.get("objects", [])
+
+    for obj in objects:
+        geometry_type = str(obj.get("geometryType", "")).lower()
+
+        if geometry_type == "bitmap" and "bitmap" in obj:
+            bitmap_mask, origin = decode_bitmap(obj["bitmap"])
+
+            if bitmap_mask is None:
+                print(f"[WARN] Could not decode bitmap in: {ann_path.name}")
+                continue
+
+            ox, oy = int(origin[0]), int(origin[1])
+            bh, bw = bitmap_mask.shape[:2]
+
+            x1, y1 = ox, oy
+            x2, y2 = min(ox + bw, w), min(oy + bh, h)
+
+            crop_w = x2 - x1
+            crop_h = y2 - y1
+
+            if crop_w <= 0 or crop_h <= 0:
+                continue
+
+            roi = bitmap_mask[:crop_h, :crop_w]
+            mask[y1:y2, x1:x2][roi > 0] = class_id
+
+        elif "polygon" in geometry_type and "points" in obj:
+            draw_polygon(mask, obj["points"], class_id, 1.0, 1.0)
+
+        elif "rectangle" in geometry_type and "points" in obj:
+            exterior = obj["points"].get("exterior", [])
+
+            if len(exterior) >= 2:
+                x1, y1 = exterior[0]
+                x2, y2 = exterior[1]
+
+                cv2.rectangle(
+                    mask,
+                    (int(x1), int(y1)),
+                    (int(x2), int(y2)),
+                    class_id,
+                    -1
+                )
+
+    return mask
+
+
+# NEW: color mask function
 def colorize_mask(mask):
-    """
-    Visualization only:
-        0 = background = black
-        1 = benign     = green
-        2 = malignant  = red
-    """
     color = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
-    color[mask == 1] = (0, 255, 0)
-    color[mask == 2] = (0, 0, 255)
+
+    color[mask == 1] = (0, 255, 0)   # benign = green
+    color[mask == 2] = (0, 0, 255)   # malignant = red
+
     return color
 
 
-def norm_text(x):
-    return str(x).strip().replace("\\", "/") if pd.notna(x) else ""
-
-
-def find_jpeg_from_path(path_text):
-    path_text = norm_text(path_text)
-    if not path_text:
-        return None
-
-    parts = [p for p in path_text.split("/") if p]
-
-    for part in reversed(parts):
-        candidate_dir = JPEG_ROOT / part
-        if candidate_dir.exists():
-            jpgs = sorted(candidate_dir.glob("*.jpg"))
-            if jpgs:
-                return jpgs[0]
-
-    last = Path(parts[-1]).stem if parts else ""
-    if last:
-        matches = sorted(JPEG_ROOT.rglob(f"*{last}*.jpg"))
-        if matches:
-            return matches[0]
-
-    return None
-
-
-def read_mask(mask_path):
-    m = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-    if m is None:
-        return None
-
-    # If already class-index/binary
-    unique_vals = np.unique(m)
-    if set(unique_vals.tolist()).issubset({0, 1, 2}):
-        return (m > 0).astype(np.uint8)
-
-    # Robust threshold for JPEG ROI masks
-    _, binary = cv2.threshold(
-        m,
-        0,
-        255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-
-    binary = (binary > 0).astype(np.uint8)
-
-    # Safety: reject masks that cover almost the whole image
-    nonzero_ratio = np.count_nonzero(binary) / binary.size
-
-    if nonzero_ratio > 0.60:
-        print(f"[WARN] Rejected suspicious full-image mask: {mask_path} ratio={nonzero_ratio:.4f}")
-        return None
-
-    if nonzero_ratio == 0:
-        print(f"[WARN] Empty mask after thresholding: {mask_path}")
-        return None
-
-    return binary
-
-
-def build_multiclass_mask(mask_paths, class_id, target_shape):
-    final = np.zeros(target_shape, dtype=np.uint8)
-
-    for mp in mask_paths:
-        m = read_mask(mp)
-        if m is None:
-            continue
-
-        if m.shape != target_shape:
-            m = cv2.resize(
-                m,
-                (target_shape[1], target_shape[0]),
-                interpolation=cv2.INTER_NEAREST
-            )
-
-        final[m > 0] = class_id
-
-    return final
-
-
-def load_case_csvs():
-    files = [
-        CSV_ROOT / "calc_case_description_train_set.csv",
-        CSV_ROOT / "calc_case_description_test_set.csv",
-        CSV_ROOT / "mass_case_description_train_set.csv",
-        CSV_ROOT / "mass_case_description_test_set.csv",
-    ]
-
-    dfs = []
-
-    for f in files:
-        if not f.exists():
-            print(f"[WARN] Missing CSV: {f}")
-            continue
-
-        df = pd.read_csv(f)
-        df["source_csv"] = f.name
-        dfs.append(df)
-
-    if not dfs:
-        raise FileNotFoundError("No CBIS case description CSV files found.")
-
-    return pd.concat(dfs, ignore_index=True)
-
-
-def pick_column(df, possible_names):
-    cols = {c.lower().strip(): c for c in df.columns}
-
-    for name in possible_names:
-        key = name.lower().strip()
-        if key in cols:
-            return cols[key]
-
-    return None
-
-
-def gather_samples():
-    df = load_case_csvs()
-
-    patient_col = pick_column(df, ["patient_id", "patient id"])
-    pathology_col = pick_column(df, ["pathology"])
-    image_col = pick_column(df, ["image file path", "image_file_path"])
-    roi_col = pick_column(df, ["roi mask file path", "roi_mask_file_path"])
-    cropped_col = pick_column(df, ["cropped image file path", "cropped_image_file_path"])
-
-    if patient_col is None or pathology_col is None or image_col is None:
-        raise ValueError(f"Required columns missing. Found columns: {list(df.columns)}")
-
+def gather_samples_from_split(split_name):
     samples = []
 
-    for row_idx, row in df.iterrows():
-        pathology = str(row[pathology_col]).strip().upper()
+    split_dir = CBIS_ROOT / split_name
+    img_dir = split_dir / "img"
 
-        if pathology not in CLASS_MAP:
-            continue
+    if not img_dir.exists():
+        print(f"[WARN] Missing image folder: {img_dir}")
+        return samples
 
-        class_id = CLASS_MAP[pathology]
-        patient_id = str(row[patient_col]).strip()
+    image_files = sorted(img_dir.glob("*.png"))
 
-        image_path = find_jpeg_from_path(row[image_col])
-        if image_path is None:
-            print(f"[WARN] Image not found for row {row_idx}")
-            continue
+    for image_path in image_files:
+        ann_path = get_ann_path(split_dir, image_path)
 
-        mask_paths = []
-
-        if roi_col is not None:
-            mp = find_jpeg_from_path(row[roi_col])
-            if mp is not None:
-                mask_paths.append(mp)
-
-        if len(mask_paths) == 0 and cropped_col is not None:
-            mp = find_jpeg_from_path(row[cropped_col])
-            if mp is not None:
-                mask_paths.append(mp)
-
-        if len(mask_paths) == 0:
-            print(f"[WARN] ROI mask not found for row {row_idx}")
+        if not ann_path.exists():
+            print(f"[WARN] Missing annotation for: {image_path.name}")
             continue
 
         samples.append({
-            "patient_id": patient_id,
-            "class_id": class_id,
-            "pathology": pathology,
+            "source_split": split_name,
             "image_path": image_path,
-            "mask_paths": mask_paths,
+            "ann_path": ann_path,
         })
 
     return samples
 
 
+def gather_samples():
+    train_samples = gather_samples_from_split("train")
+    test_samples = gather_samples_from_split("test")
+
+    return train_samples, test_samples
+
+
 def save_split(split_name, samples):
     out_img_dir = OUT_ROOT / split_name / "images"
     out_mask_dir = OUT_ROOT / split_name / "masks"
-    out_mask_color_dir = OUT_ROOT / split_name / "masks_color"
+    out_color_mask_dir = OUT_ROOT / split_name / "color_masks"
 
-    for idx, s in enumerate(samples):
-        img = cv2.imread(str(s["image_path"]), cv2.IMREAD_GRAYSCALE)
+    ensure_dir(out_img_dir)
+    ensure_dir(out_mask_dir)
+    ensure_dir(out_color_mask_dir)
+
+    for idx, sample in enumerate(samples):
+        image_path = sample["image_path"]
+        ann_path = sample["ann_path"]
+
+        img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
 
         if img is None:
-            print(f"[WARN] Could not read image: {s['image_path']}")
+            print(f"[WARN] Could not read image: {image_path}")
             continue
 
-        mask = build_multiclass_mask(
-            mask_paths=s["mask_paths"],
-            class_id=s["class_id"],
-            target_shape=img.shape,
-        )
+        mask = build_mask_from_json(ann_path, image_shape=img.shape)
 
-        mask_color = colorize_mask(mask)
+        if mask is None:
+            print(f"[WARN] Could not build mask for: {image_path}")
+            continue
 
-        prefix = "benign" if s["class_id"] == 1 else "malignant"
-        safe_patient = s["patient_id"].replace("/", "_").replace("\\", "_")
-        name = f"{prefix}_{safe_patient}_{idx:05d}.png"
+        color_mask = colorize_mask(mask)
 
-        cv2.imwrite(str(out_img_dir / name), img)
+        file_name = f"{image_path.stem}_{idx:04d}.png"
 
-        # Training mask: keep as grayscale class IDs 0/1/2
-        cv2.imwrite(str(out_mask_dir / name), mask)
-
-        # Visualization mask: colored copy only
-        cv2.imwrite(str(out_mask_color_dir / name), mask_color)
-
-
-def patientwise_split(samples):
-    patients = sorted(list({s["patient_id"] for s in samples}))
-
-    train_p, temp_p = train_test_split(
-        patients,
-        test_size=0.20,
-        random_state=RANDOM_STATE,
-        shuffle=True
-    )
-
-    val_p, test_p = train_test_split(
-        temp_p,
-        test_size=0.50,
-        random_state=RANDOM_STATE,
-        shuffle=True
-    )
-
-    train_p, val_p, test_p = set(train_p), set(val_p), set(test_p)
-
-    train_s = [s for s in samples if s["patient_id"] in train_p]
-    val_s = [s for s in samples if s["patient_id"] in val_p]
-    test_s = [s for s in samples if s["patient_id"] in test_p]
-
-    return train_s, val_s, test_s
+        cv2.imwrite(str(out_img_dir / file_name), img)
+        cv2.imwrite(str(out_mask_dir / file_name), mask)
+        cv2.imwrite(str(out_color_mask_dir / file_name), color_mask)
 
 
 def main():
-    clean_output()
+    ensure_dir(OUT_ROOT)
 
-    samples = gather_samples()
+    original_train_samples, original_test_samples = gather_samples()
 
-    print(f"Total usable ROI samples: {len(samples)}")
+    print(f"Original train samples: {len(original_train_samples)}")
+    print(f"Original test samples : {len(original_test_samples)}")
 
-    benign = sum(1 for s in samples if s["class_id"] == 1)
-    malignant = sum(1 for s in samples if s["class_id"] == 2)
+    train_samples, val_samples = train_test_split(
+        original_train_samples,
+        test_size=0.10,
+        random_state=RANDOM_STATE,
+        shuffle=True
+    )
 
-    print(f"Benign samples   : {benign}")
-    print(f"Malignant samples: {malignant}")
+    test_samples = original_test_samples
 
-    train_s, val_s, test_s = patientwise_split(samples)
+    print(f"Train: {len(train_samples)}")
+    print(f"Val  : {len(val_samples)}")
+    print(f"Test : {len(test_samples)}")
 
-    print(f"Train: {len(train_s)}")
-    print(f"Val  : {len(val_s)}")
-    print(f"Test : {len(test_s)}")
-
-    save_split("train", train_s)
-    save_split("val", val_s)
-    save_split("test", test_s)
+    save_split("train", train_samples)
+    save_split("val", val_samples)
+    save_split("test", test_samples)
 
     print(f"\nFinished. Output at: {OUT_ROOT.resolve()}")
-    print("Training masks saved in: dataset_seg/<split>/masks")
-    print("Colored masks saved in : dataset_seg/<split>/masks_color")
 
 
 if __name__ == "__main__":

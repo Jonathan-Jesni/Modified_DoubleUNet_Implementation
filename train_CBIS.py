@@ -17,18 +17,20 @@ from utils import (
     epoch_time,
     calculate_metrics,
 )
-from model import build_doubleunet
+from CBIS_model import build_doubleunet
 from metrics import CombinedLoss
 
 
 DEBUG_VIS_DIR = "files/debug_train_visuals"
 SAVE_DEBUG_EVERY_N_SAMPLES = 100
 
+NUM_CLASSES = 3
+
 
 def colorize_mask(mask):
     color = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
-    color[mask == 1] = (0, 255, 0)   # benign = green
-    color[mask == 2] = (0, 0, 255)   # malignant = red
+    color[mask == 1] = (0, 255, 0)      # benign = green
+    color[mask == 2] = (0, 0, 255)      # malignant = red
     return color
 
 
@@ -43,6 +45,7 @@ def save_debug_visual(image_rgb, mask, out_path):
 
     overlay = image_vis.copy()
     lesion = mask > 0
+
     overlay[lesion] = (
         image_vis[lesion].astype(np.float32) * 0.55
         + mask_color[lesion].astype(np.float32) * 0.45
@@ -54,27 +57,40 @@ def save_debug_visual(image_rgb, mask, out_path):
 
 def load_data(path):
     def get_split_data(split_name):
-        images = sorted(glob(os.path.join(path, split_name, "images", "*.png")))
-        masks = sorted(glob(os.path.join(path, split_name, "masks", "*.png")))
-        return images, masks
+        img_dir = os.path.join(path, split_name, "images")
+        mask_dir = os.path.join(path, split_name, "masks")
+
+        images = sorted(glob(os.path.join(img_dir, "*.png")))
+        masks = sorted(glob(os.path.join(mask_dir, "*.png")))
+
+        image_dict = {os.path.basename(x): x for x in images}
+        mask_dict = {os.path.basename(y): y for y in masks}
+
+        common_names = sorted(set(image_dict.keys()) & set(mask_dict.keys()))
+
+        paired_images = [image_dict[name] for name in common_names]
+        paired_masks = [mask_dict[name] for name in common_names]
+
+        missing_masks = sorted(set(image_dict.keys()) - set(mask_dict.keys()))
+        missing_images = sorted(set(mask_dict.keys()) - set(image_dict.keys()))
+
+        if missing_masks:
+            print(f"[WARN] {split_name}: {len(missing_masks)} images have no matching mask.")
+        if missing_images:
+            print(f"[WARN] {split_name}: {len(missing_images)} masks have no matching image.")
+
+        return paired_images, paired_masks
 
     train_x, train_y = get_split_data("train")
     valid_x, valid_y = get_split_data("val")
     test_x, test_y = get_split_data("test")
 
     if len(train_x) == 0:
-        raise FileNotFoundError(f"No training images found in: {os.path.join(path, 'train', 'images')}")
+        raise FileNotFoundError(f"No training image/mask pairs found in: {os.path.join(path, 'train')}")
     if len(valid_x) == 0:
-        raise FileNotFoundError(f"No validation images found in: {os.path.join(path, 'val', 'images')}")
+        raise FileNotFoundError(f"No validation image/mask pairs found in: {os.path.join(path, 'val')}")
     if len(test_x) == 0:
-        print("[INFO] No test images found. Test split will remain empty for now.")
-
-    if len(train_x) != len(train_y):
-        raise ValueError(f"Train images/masks mismatch: {len(train_x)} images vs {len(train_y)} masks")
-    if len(valid_x) != len(valid_y):
-        raise ValueError(f"Val images/masks mismatch: {len(valid_x)} images vs {len(valid_y)} masks")
-    if len(test_x) != len(test_y):
-        raise ValueError(f"Test images/masks mismatch: {len(test_x)} images vs {len(test_y)} masks")
+        print("[INFO] No test image/mask pairs found. Test split will remain empty for now.")
 
     return [(train_x, train_y), (valid_x, valid_y), (test_x, test_y)]
 
@@ -104,9 +120,11 @@ class DATASET(Dataset):
 
         image = cv2.resize(image, self.size, interpolation=cv2.INTER_LINEAR)
         mask = cv2.resize(mask, self.size, interpolation=cv2.INTER_NEAREST)
-        mask = np.clip(mask, 0, 2).astype(np.uint8)
 
-        # Save pre-augmentation debug panel: image | colored GT mask | overlay
+        # keep class IDs exactly as prepared:
+        # 0 = background, 1 = benign, 2 = malignant
+        mask = np.clip(mask, 0, NUM_CLASSES - 1).astype(np.uint8)
+
         if index % SAVE_DEBUG_EVERY_N_SAMPLES == 0:
             out_name = os.path.basename(image_path)
             save_debug_visual(
@@ -119,6 +137,8 @@ class DATASET(Dataset):
             augmented = self.transform(image=image, mask=mask)
             image = augmented["image"]
             mask = augmented["mask"]
+
+            mask = np.clip(mask, 0, NUM_CLASSES - 1).astype(np.uint8)
 
         image = np.transpose(image, (2, 0, 1))
         image = image.astype(np.float32) / 255.0
@@ -250,6 +270,7 @@ if __name__ == "__main__":
     data_str = f"Image Size: {size}\nBatch Size: {batch_size}\nLR: {lr}\nEpochs: {num_epochs}\n"
     data_str += f"Early Stopping Patience: {early_stopping_patience}\n"
     data_str += f"Dataset Path: {path}\n"
+    data_str += f"Classes: {NUM_CLASSES} -> 0 background, 1 benign, 2 malignant\n"
     print_and_save(train_log_path, data_str)
 
     (train_x, train_y), (valid_x, valid_y), (test_x, test_y) = load_data(path)
@@ -308,9 +329,13 @@ if __name__ == "__main__":
         model.load_state_dict(torch.load(checkpoint_path, map_location=device))
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        patience=5
+    )
 
-    loss_fn = CombinedLoss(num_classes=3)
+    loss_fn = CombinedLoss(num_classes=NUM_CLASSES)
     loss_name = "CrossEntropy + Multi-Class Dice Loss"
 
     print_and_save(train_log_path, f"Optimizer: Adam\nLoss: {loss_name}\n")

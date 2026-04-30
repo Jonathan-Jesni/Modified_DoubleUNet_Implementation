@@ -17,7 +17,7 @@ from utils import (
     epoch_time,
     calculate_metrics,
 )
-from model import build_doubleunet
+from BUSI_model import build_doubleunet
 from metrics import DiceBCELoss, MultiClassDiceLoss, CombinedLoss
 
 

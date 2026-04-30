@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 import torch
 
-from model import build_doubleunet
+from BUSI_model import build_doubleunet
 from utils import calculate_metrics
 
 

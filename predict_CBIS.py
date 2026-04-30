@@ -6,13 +6,9 @@ import cv2
 import numpy as np
 import torch
 
-from model import build_doubleunet
-from utils import calculate_metrics
+from CBIS_model import build_doubleunet
 
 
-# =========================================================
-# CONFIG
-# =========================================================
 CHECKPOINT_PATH = "files/checkpoint.pth"
 
 IMAGE_DIR = "dataset_seg/test/images"
@@ -26,12 +22,10 @@ PANEL_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "panels")
 CSV_PATH = os.path.join(OUTPUT_DIR, "metrics.csv")
 
 IMAGE_SIZE = (256, 256)
+NUM_CLASSES = 3
 USE_P1_TOO = False
 
 
-# =========================================================
-# UTILS
-# =========================================================
 def ensure_dirs():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(MASK_OUTPUT_DIR, exist_ok=True)
@@ -44,16 +38,51 @@ def ensure_dirs():
         os.makedirs(os.path.join(OUTPUT_DIR, "prob_maps_p1"), exist_ok=True)
 
 
+def calculate_multiclass_metrics(y_true, y_pred, num_classes=3):
+    jaccards = []
+    dices = []
+    recalls = []
+    precisions = []
+
+    for cls in range(1, num_classes):
+        true_cls = y_true == cls
+        pred_cls = y_pred == cls
+
+        tp = np.logical_and(true_cls, pred_cls).sum()
+        fp = np.logical_and(~true_cls, pred_cls).sum()
+        fn = np.logical_and(true_cls, ~pred_cls).sum()
+
+        if true_cls.sum() == 0 and pred_cls.sum() == 0:
+            continue
+
+        jaccard = tp / (tp + fp + fn + 1e-7)
+        dice = (2 * tp) / (2 * tp + fp + fn + 1e-7)
+        recall = tp / (tp + fn + 1e-7)
+        precision = tp / (tp + fp + 1e-7)
+
+        jaccards.append(jaccard)
+        dices.append(dice)
+        recalls.append(recall)
+        precisions.append(precision)
+
+    if len(jaccards) == 0:
+        return 0.0, 0.0, 0.0, 0.0
+
+    return (
+        float(np.mean(jaccards)),
+        float(np.mean(dices)),
+        float(np.mean(recalls)),
+        float(np.mean(precisions)),
+    )
+
+
 def load_image(image_path, size):
     image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+
     if image is None:
         raise ValueError(f"Failed to read image: {image_path}")
 
     original_gray = image.copy()
-
-    # Optional mammogram contrast enhancement
-    # Keep this disabled unless you also used it in train.py.
-    # image = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(image)
 
     image_rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
     image_resized = cv2.resize(image_rgb, size, interpolation=cv2.INTER_LINEAR)
@@ -68,18 +97,13 @@ def load_image(image_path, size):
 
 
 def load_gt_mask(mask_path, size):
-    """
-    Reads class-index mask:
-        0 = background
-        1 = benign lesion
-        2 = malignant lesion
-    """
     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+
     if mask is None:
         raise ValueError(f"Failed to read mask: {mask_path}")
 
     mask = cv2.resize(mask, size, interpolation=cv2.INTER_NEAREST)
-    mask = np.clip(mask, 0, 2).astype(np.int64)
+    mask = np.clip(mask, 0, NUM_CLASSES - 1).astype(np.uint8)
 
     return mask
 
@@ -87,20 +111,16 @@ def load_gt_mask(mask_path, size):
 def tensor_to_prediction(pred_tensor):
     prob = torch.softmax(pred_tensor, dim=1).detach().cpu().numpy()[0]
     pred_classes = np.argmax(prob, axis=0).astype(np.uint8)
+
     return prob, pred_classes
 
 
 def colorize_mask(mask_classes):
-    """
-    Class 0: Background - black
-    Class 1: Benign     - green
-    Class 2: Malignant  - red
-    """
     h, w = mask_classes.shape
     color = np.zeros((h, w, 3), dtype=np.uint8)
 
-    color[mask_classes == 1] = (0, 255, 0)
-    color[mask_classes == 2] = (0, 0, 255)
+    color[mask_classes == 1] = (0, 255, 0)      # benign = green
+    color[mask_classes == 2] = (0, 0, 255)      # malignant = red
 
     return color
 
@@ -124,10 +144,8 @@ def make_gt_overlay(base_gray, gt_classes, alpha=0.45):
     base_bgr = cv2.cvtColor(base_gray, cv2.COLOR_GRAY2BGR)
 
     gt_color = np.zeros_like(base_bgr)
-
-    # GT colors intentionally different from prediction colors
-    gt_color[gt_classes == 1] = (255, 0, 0)      # blue for benign GT
-    gt_color[gt_classes == 2] = (255, 0, 255)    # magenta for malignant GT
+    gt_color[gt_classes == 1] = (255, 0, 0)      # benign GT = blue
+    gt_color[gt_classes == 2] = (255, 0, 255)    # malignant GT = magenta
 
     overlay = base_bgr.copy()
     lesion = gt_classes > 0
@@ -163,7 +181,6 @@ def make_panel(image_gray_resized, gt_classes, prob_u8, pred_classes, metrics, n
 
     gt_bgr = colorize_mask(gt_classes)
     pred_bgr = colorize_mask(pred_classes)
-
     prob_bgr = cv2.applyColorMap(prob_u8, cv2.COLORMAP_JET)
 
     gt_overlay = make_gt_overlay(image_gray_resized, gt_classes)
@@ -171,7 +188,7 @@ def make_panel(image_gray_resized, gt_classes, prob_u8, pred_classes, metrics, n
 
     a = add_title(original_bgr, f"Image: {name}")
     b = add_title(gt_bgr, "Ground Truth")
-    c = add_title(prob_bgr, "Lesion Probability Map")
+    c = add_title(prob_bgr, "Lesion Probability")
     d = add_title(pred_bgr, "Predicted Mask")
     e = add_title(gt_overlay, "GT Overlay")
     f = add_title(
@@ -198,11 +215,8 @@ def write_csv(rows, csv_path):
 
 
 def find_matching_mask(mask_dir, image_name):
-    """
-    Prepared dataset should use same filename for image and mask.
-    This helper also handles .jpg/.png mismatch just in case.
-    """
     direct = os.path.join(mask_dir, image_name)
+
     if os.path.exists(direct):
         return direct
 
@@ -210,15 +224,13 @@ def find_matching_mask(mask_dir, image_name):
 
     for ext in [".png", ".jpg", ".jpeg"]:
         candidate = os.path.join(mask_dir, stem + ext)
+
         if os.path.exists(candidate):
             return candidate
 
     return None
 
 
-# =========================================================
-# MAIN
-# =========================================================
 def main():
     ensure_dirs()
 
@@ -285,20 +297,15 @@ def main():
 
             prob_map, pred_classes = tensor_to_prediction(p2)
 
-            gt_tensor = torch.from_numpy(gt_classes).to(device)
-            pred_tensor = torch.from_numpy(pred_classes).to(device)
-
-            m_jaccard, m_f1, m_recall, m_precision = calculate_metrics(
-                gt_tensor,
-                pred_tensor
+            m_jaccard, m_f1, m_recall, m_precision = calculate_multiclass_metrics(
+                gt_classes,
+                pred_classes,
+                NUM_CLASSES
             )
 
-            # Save predicted mask as true class IDs:
-            # 0 = background, 1 = benign, 2 = malignant
             pred_save = pred_classes.astype(np.uint8)
             cv2.imwrite(os.path.join(MASK_OUTPUT_DIR, name), pred_save)
 
-            # Combined lesion probability: benign + malignant
             prob_vis = (np.sum(prob_map[1:], axis=0) * 255).astype(np.uint8)
             cv2.imwrite(os.path.join(PROB_OUTPUT_DIR, name), prob_vis)
 
@@ -344,13 +351,13 @@ def main():
             if USE_P1_TOO:
                 p1_prob_map, p1_pred_classes = tensor_to_prediction(p1)
 
-                p1_pred_save = p1_pred_classes.astype(np.uint8)
                 cv2.imwrite(
                     os.path.join(OUTPUT_DIR, "pred_masks_p1", name),
-                    p1_pred_save
+                    p1_pred_classes.astype(np.uint8)
                 )
 
                 p1_prob_vis = (np.sum(p1_prob_map[1:], axis=0) * 255).astype(np.uint8)
+
                 cv2.imwrite(
                     os.path.join(OUTPUT_DIR, "prob_maps_p1", name),
                     p1_prob_vis
@@ -360,7 +367,7 @@ def main():
 
     if len(all_rows) > 0:
         print("\n" + "=" * 60)
-        print("[SUMMARY - MULTI-CLASS]")
+        print("[SUMMARY - MULTI-CLASS CBIS]")
         print(f"Images evaluated : {len(all_rows)}")
         print(f"Mean Jaccard     : {np.mean(summary_metrics['jaccard']):.4f}")
         print(f"Mean F1 / Dice   : {np.mean(summary_metrics['f1']):.4f}")
