@@ -1,185 +1,246 @@
-# RUN THIS SCRIPT FROM PROJECT ROOT
-# Example:
-# C:\Users\User\Projects\Modified_DoubleUNet_Implementation>
-# python prepare_cbis_masks.py
-
-import os
-import io
-import json
-import zlib
-import base64
 from pathlib import Path
+import shutil
 import cv2
 import numpy as np
-from PIL import Image
+import pandas as pd
+from sklearn.model_selection import train_test_split
 
-# Project root = folder containing this script
+
 ROOT = Path(__file__).resolve().parent
-
-# Original downloaded Kaggle dataset lives inside project_root/dataset/
-DATASET_ROOT = ROOT / "dataset"
-
-# Input splits inside dataset/
-SRC_SPLITS = ["train", "test"]
-
-# Output folder generated in root dir
+CBIS_ROOT = ROOT / "CBIS_dataset"
+CSV_ROOT = CBIS_ROOT / "csv"
+JPEG_ROOT = CBIS_ROOT / "jpeg"
 OUT_ROOT = ROOT / "dataset_seg"
+
+RANDOM_STATE = 42
+
+CLASS_MAP = {
+    "BENIGN": 1,
+    "BENIGN_WITHOUT_CALLBACK": 1,
+    "MALIGNANT": 2,
+}
 
 
 def ensure_dir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
 
 
-def decode_supervisely_bitmap(b64_data: str) -> np.ndarray:
+def clean_output():
+    if OUT_ROOT.exists():
+        shutil.rmtree(OUT_ROOT)
+    for split in ["train", "val", "test"]:
+        ensure_dir(OUT_ROOT / split / "images")
+        ensure_dir(OUT_ROOT / split / "masks")
+
+
+def norm_text(x):
+    return str(x).strip().replace("\\", "/") if pd.notna(x) else ""
+
+
+def find_jpeg_from_path(path_text):
     """
-    Decode Supervisely / DatasetNinja bitmap annotation
-    into binary uint8 mask {0,255}
+    CSV paths usually contain DICOM-style folder/file hints.
+    This function searches the jpeg folder using the last useful path parts.
     """
-    compressed = base64.b64decode(b64_data)
-    decompressed = zlib.decompress(compressed)
+    path_text = norm_text(path_text)
+    if not path_text:
+        return None
 
-    img = Image.open(io.BytesIO(decompressed)).convert("RGBA")
-    arr = np.array(img)
+    parts = [p for p in path_text.split("/") if p]
 
-    if arr.shape[-1] == 4:
-        alpha = arr[:, :, 3]
-        mask = (alpha > 0).astype(np.uint8) * 255
-    else:
-        mask = (np.any(arr[:, :, :3] > 0, axis=-1)).astype(np.uint8) * 255
+    # Try UID folder match
+    for part in reversed(parts):
+        candidate_dir = JPEG_ROOT / part
+        if candidate_dir.exists():
+            jpgs = sorted(candidate_dir.glob("*.jpg"))
+            if jpgs:
+                return jpgs[0]
 
-    return mask
+    # Fallback: try filename stem contains
+    last = Path(parts[-1]).stem if parts else ""
+    if last:
+        matches = sorted(JPEG_ROOT.rglob(f"*{last}*.jpg"))
+        if matches:
+            return matches[0]
+
+    return None
 
 
-def build_full_mask(json_path: Path) -> np.ndarray:
-    with open(json_path, "r", encoding="utf-8") as f:
-        ann = json.load(f)
+def read_mask(mask_path):
+    m = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if m is None:
+        return None
+    return (m > 0).astype(np.uint8)
 
-    h = ann["size"]["height"]
-    w = ann["size"]["width"]
 
-    full_mask = np.zeros((h, w), dtype=np.uint8)
+def build_multiclass_mask(mask_paths, class_id, target_shape):
+    final = np.zeros(target_shape, dtype=np.uint8)
 
-    for obj in ann.get("objects", []):
-        if obj.get("geometryType") != "bitmap":
+    for mp in mask_paths:
+        m = read_mask(mp)
+        if m is None:
             continue
 
-        bmp = obj.get("bitmap", {})
-        data = bmp.get("data")
-        origin = bmp.get("origin", [0, 0])
+        if m.shape != target_shape:
+            m = cv2.resize(m, (target_shape[1], target_shape[0]), interpolation=cv2.INTER_NEAREST)
 
-        if data is None:
+        final[m > 0] = class_id
+
+    return final
+
+
+def load_case_csvs():
+    files = [
+        CSV_ROOT / "calc_case_description_train_set.csv",
+        CSV_ROOT / "calc_case_description_test_set.csv",
+        CSV_ROOT / "mass_case_description_train_set.csv",
+        CSV_ROOT / "mass_case_description_test_set.csv",
+    ]
+
+    dfs = []
+    for f in files:
+        if not f.exists():
+            print(f"[WARN] Missing CSV: {f}")
             continue
 
-        patch = decode_supervisely_bitmap(data)
+        df = pd.read_csv(f)
+        df["source_csv"] = f.name
+        dfs.append(df)
 
-        x, y = origin
-        ph, pw = patch.shape[:2]
+    if not dfs:
+        raise FileNotFoundError("No CBIS case description CSV files found.")
 
-        x2 = min(x + pw, w)
-        y2 = min(y + ph, h)
+    return pd.concat(dfs, ignore_index=True)
 
-        patch = patch[: y2 - y, : x2 - x]
 
-        full_mask[y:y2, x:x2] = np.maximum(
-            full_mask[y:y2, x:x2],
-            patch
+def pick_column(df, possible_names):
+    cols = {c.lower().strip(): c for c in df.columns}
+    for name in possible_names:
+        key = name.lower().strip()
+        if key in cols:
+            return cols[key]
+    return None
+
+
+def gather_samples():
+    df = load_case_csvs()
+
+    patient_col = pick_column(df, ["patient_id", "patient id"])
+    pathology_col = pick_column(df, ["pathology"])
+    image_col = pick_column(df, ["image file path", "image_file_path"])
+    roi_col = pick_column(df, ["roi mask file path", "roi_mask_file_path"])
+    cropped_col = pick_column(df, ["cropped image file path", "cropped_image_file_path"])
+
+    if patient_col is None or pathology_col is None or image_col is None:
+        raise ValueError(f"Required columns missing. Found columns: {list(df.columns)}")
+
+    samples = []
+
+    for row_idx, row in df.iterrows():
+        pathology = str(row[pathology_col]).strip().upper()
+        if pathology not in CLASS_MAP:
+            continue
+
+        class_id = CLASS_MAP[pathology]
+        patient_id = str(row[patient_col]).strip()
+
+        image_path = find_jpeg_from_path(row[image_col])
+        if image_path is None:
+            print(f"[WARN] Image not found for row {row_idx}")
+            continue
+
+        mask_paths = []
+
+        if roi_col is not None:
+            mp = find_jpeg_from_path(row[roi_col])
+            if mp is not None:
+                mask_paths.append(mp)
+
+        if len(mask_paths) == 0 and cropped_col is not None:
+            mp = find_jpeg_from_path(row[cropped_col])
+            if mp is not None:
+                mask_paths.append(mp)
+
+        if len(mask_paths) == 0:
+            print(f"[WARN] ROI mask not found for row {row_idx}")
+            continue
+
+        samples.append({
+            "patient_id": patient_id,
+            "class_id": class_id,
+            "pathology": pathology,
+            "image_path": image_path,
+            "mask_paths": mask_paths,
+        })
+
+    return samples
+
+
+def save_split(split_name, samples):
+    out_img_dir = OUT_ROOT / split_name / "images"
+    out_mask_dir = OUT_ROOT / split_name / "masks"
+
+    for idx, s in enumerate(samples):
+        img = cv2.imread(str(s["image_path"]), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            print(f"[WARN] Could not read image: {s['image_path']}")
+            continue
+
+        mask = build_multiclass_mask(
+            mask_paths=s["mask_paths"],
+            class_id=s["class_id"],
+            target_shape=img.shape,
         )
 
-    return full_mask
+        prefix = "benign" if s["class_id"] == 1 else "malignant"
+        safe_patient = s["patient_id"].replace("/", "_").replace("\\", "_")
+        name = f"{prefix}_{safe_patient}_{idx:05d}.png"
+
+        cv2.imwrite(str(out_img_dir / name), img)
+        cv2.imwrite(str(out_mask_dir / name), mask)
 
 
-def process_split(split: str):
-    img_dir = DATASET_ROOT / split / "img"
-    ann_dir = DATASET_ROOT / split / "ann"
+def patientwise_split(samples):
+    patients = sorted(list({s["patient_id"] for s in samples}))
 
-    out_img_dir = OUT_ROOT / split / "images"
-    out_mask_dir = OUT_ROOT / split / "masks"
+    train_p, temp_p = train_test_split(
+        patients, test_size=0.20, random_state=RANDOM_STATE, shuffle=True
+    )
+    val_p, test_p = train_test_split(
+        temp_p, test_size=0.50, random_state=RANDOM_STATE, shuffle=True
+    )
 
-    ensure_dir(out_img_dir)
-    ensure_dir(out_mask_dir)
+    train_p, val_p, test_p = set(train_p), set(val_p), set(test_p)
 
-    if not img_dir.exists():
-        print(f"[ERROR] Missing image folder: {img_dir}")
-        return
+    train_s = [s for s in samples if s["patient_id"] in train_p]
+    val_s = [s for s in samples if s["patient_id"] in val_p]
+    test_s = [s for s in samples if s["patient_id"] in test_p]
 
-    if not ann_dir.exists():
-        print(f"[ERROR] Missing annotation folder: {ann_dir}")
-        return
-
-    image_files = sorted(img_dir.glob("*.png"))
-    json_files = sorted(ann_dir.glob("*.json"))
-
-    image_map = {p.name: p for p in image_files}
-    ann_map = {p.name.replace(".json", ""): p for p in json_files}
-
-    common_names = sorted(set(image_map.keys()) & set(ann_map.keys()))
-    ann_without_img = sorted(set(ann_map.keys()) - set(image_map.keys()))
-    img_without_ann = sorted(set(image_map.keys()) - set(ann_map.keys()))
-
-    print(f"\nProcessing split: {split}")
-    print(f"Images found        : {len(image_files)}")
-    print(f"Annotations found   : {len(json_files)}")
-    print(f"Matched pairs       : {len(common_names)}")
-    print(f"Ann without image   : {len(ann_without_img)}")
-    print(f"Img without ann     : {len(img_without_ann)}")
-
-    if ann_without_img[:10]:
-        print("\nFirst 10 annotations without matching image:")
-        for name in ann_without_img[:10]:
-            print("  ", name)
-
-    ok = 0
-    unreadable = 0
-    failed_mask = 0
-
-    for image_name in common_names:
-        image_path = image_map[image_name]
-        json_path = ann_map[image_name]
-
-        try:
-            mask = build_full_mask(json_path)
-        except Exception as e:
-            print(f"[WARN] Failed mask build: {json_path.name} | {e}")
-            failed_mask += 1
-            continue
-
-        img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            print(f"[WARN] Could not read image: {image_path}")
-            unreadable += 1
-            continue
-
-        out_img_path = out_img_dir / image_name
-        out_mask_path = out_mask_dir / image_name
-
-        cv2.imwrite(str(out_img_path), img)
-        cv2.imwrite(str(out_mask_path), mask)
-
-        ok += 1
-        if ok % 100 == 0:
-            print(f"Saved {ok} samples...")
-
-    print(f"\nDone {split}")
-    print(f"Saved        : {ok}")
-    print(f"Unreadable   : {unreadable}")
-    print(f"Failed masks : {failed_mask}")
+    return train_s, val_s, test_s
 
 
 def main():
-    print("=" * 60)
-    print("CBIS-DDSM MASK PREPARATION")
-    print("=" * 60)
-    print(f"Project Root : {ROOT}")
-    print(f"Dataset Root : {DATASET_ROOT}")
-    print(f"Output Root  : {OUT_ROOT}")
+    clean_output()
 
-    ensure_dir(OUT_ROOT)
+    samples = gather_samples()
+    print(f"Total usable ROI samples: {len(samples)}")
 
-    for split in SRC_SPLITS:
-        process_split(split)
+    benign = sum(1 for s in samples if s["class_id"] == 1)
+    malignant = sum(1 for s in samples if s["class_id"] == 2)
+    print(f"Benign samples   : {benign}")
+    print(f"Malignant samples: {malignant}")
 
-    print("\nFinished.")
-    print(f"Generated dataset at:\n{OUT_ROOT.resolve()}")
+    train_s, val_s, test_s = patientwise_split(samples)
+
+    print(f"Train: {len(train_s)}")
+    print(f"Val  : {len(val_s)}")
+    print(f"Test : {len(test_s)}")
+
+    save_split("train", train_s)
+    save_split("val", val_s)
+    save_split("test", test_s)
+
+    print(f"\nFinished. Output at: {OUT_ROOT.resolve()}")
 
 
 if __name__ == "__main__":
