@@ -257,17 +257,26 @@ def main():
 
     original_train_samples, original_test_samples = gather_samples()
 
-    print(f"Original train samples: {len(original_train_samples)}")
-    print(f"Original test samples : {len(original_test_samples)}")
+    # 1. Combine all valid samples from both folders into one big list
+    all_samples = original_train_samples + original_test_samples
 
-    train_samples, val_samples = train_test_split(
-        original_train_samples,
-        test_size=0.10,
+    print(f"Total usable samples found: {len(all_samples)}")
+
+    # 2. First split: Take 80% for Training, leaving 20% for Temp (Val + Test)
+    train_samples, temp_samples = train_test_split(
+        all_samples,
+        test_size=0.20,
         random_state=RANDOM_STATE,
         shuffle=True
     )
 
-    test_samples = original_test_samples
+    # 3. Second split: Cut that 20% Temp exactly in half (10% Val, 10% Test)
+    val_samples, test_samples = train_test_split(
+        temp_samples,
+        test_size=0.50,
+        random_state=RANDOM_STATE,
+        shuffle=True
+    )
 
     print(f"Train: {len(train_samples)}")
     print(f"Val  : {len(val_samples)}")
