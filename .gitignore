@@ -76,7 +76,8 @@ files/
 # ==================================================
 # Dataset Files (large local data)
 # ==================================================
-dataset_seg/
+dataset_seg_BUSI/
+dataset_seg_CBIS/
 CBIS_dataset/
 BUSI_dataset/
 images/
