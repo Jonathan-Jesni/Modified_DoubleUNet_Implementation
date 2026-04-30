@@ -80,7 +80,33 @@ def read_mask(mask_path):
     if m is None:
         return None
 
-    return (m > 0).astype(np.uint8)
+    # If already class-index/binary
+    unique_vals = np.unique(m)
+    if set(unique_vals.tolist()).issubset({0, 1, 2}):
+        return (m > 0).astype(np.uint8)
+
+    # Robust threshold for JPEG ROI masks
+    _, binary = cv2.threshold(
+        m,
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    binary = (binary > 0).astype(np.uint8)
+
+    # Safety: reject masks that cover almost the whole image
+    nonzero_ratio = np.count_nonzero(binary) / binary.size
+
+    if nonzero_ratio > 0.60:
+        print(f"[WARN] Rejected suspicious full-image mask: {mask_path} ratio={nonzero_ratio:.4f}")
+        return None
+
+    if nonzero_ratio == 0:
+        print(f"[WARN] Empty mask after thresholding: {mask_path}")
+        return None
+
+    return binary
 
 
 def build_multiclass_mask(mask_paths, class_id, target_shape):
