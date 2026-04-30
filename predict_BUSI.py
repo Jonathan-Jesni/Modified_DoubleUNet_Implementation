@@ -15,8 +15,8 @@ from utils import calculate_metrics
 # =========================================================
 CHECKPOINT_PATH = "files/BUSI_checkpoint.pth.zip"
 
-IMAGE_DIR = "dataset_seg/test/images"
-MASK_DIR = "dataset_seg/test/masks"
+IMAGE_DIR = "dataset_seg_BUSI/test/images"
+MASK_DIR = "dataset_seg_BUSI/test/masks"
 
 OUTPUT_DIR = "files/predictions"
 MASK_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "pred_masks")

@@ -11,8 +11,8 @@ from CBIS_model import build_doubleunet
 
 CHECKPOINT_PATH = "files/CBIS_checkpoint.pth"
 
-IMAGE_DIR = "dataset_seg/test/images"
-MASK_DIR = "dataset_seg/test/masks"
+IMAGE_DIR = "dataset_seg_CBIS/test/images"
+MASK_DIR = "dataset_seg_CBIS/test/masks"
 
 OUTPUT_DIR = "files/predictions"
 MASK_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "pred_masks")

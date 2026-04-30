@@ -24,7 +24,7 @@ from metrics import DiceBCELoss, MultiClassDiceLoss, CombinedLoss
 def load_data(path):
     """
     Expected dataset structure:
-    dataset_seg/
+    dataset_seg_BUSI/
         train/
             images/*.png
             masks/*.png

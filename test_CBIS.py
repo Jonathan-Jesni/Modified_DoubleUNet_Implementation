@@ -16,8 +16,8 @@ from utils import create_dir, seeding
 
 NUM_CLASSES = 3
 SIZE = (256, 256)
-DATASET_PATH = "dataset_seg"
-CHECKPOINT_PATH = "files/checkpoint.pth"
+DATASET_PATH = "dataset_seg_CBIS"
+CHECKPOINT_PATH = "files/CBIS_checkpoint.pth"
 SAVE_PATH = "results_CBIS"
 
 
