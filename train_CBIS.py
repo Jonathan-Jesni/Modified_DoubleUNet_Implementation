@@ -243,7 +243,7 @@ if __name__ == "__main__":
     create_dir("files")
     create_dir(DEBUG_VIS_DIR)
 
-    train_log_path = "files/train_log.txt"
+    train_log_path = "files/CBIS_train_log.txt"
     if not os.path.exists(train_log_path):
         with open(train_log_path, "w") as f:
             f.write("\n")
