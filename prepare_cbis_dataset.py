@@ -155,7 +155,6 @@ def build_mask_from_json(ann_path: Path, image_shape):
     return mask
 
 
-# NEW: color mask function
 def colorize_mask(mask):
     color = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
 
@@ -163,6 +162,21 @@ def colorize_mask(mask):
     color[mask == 2] = (0, 0, 255)   # malignant = red
 
     return color
+
+
+def make_overlay(image_gray, mask, alpha=0.4):
+    image_bgr = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2BGR)
+    mask_color = colorize_mask(mask)
+
+    overlay = image_bgr.copy()
+    lesion = mask > 0
+
+    overlay[lesion] = (
+        image_bgr[lesion].astype(np.float32) * (1 - alpha)
+        + mask_color[lesion].astype(np.float32) * alpha
+    ).astype(np.uint8)
+
+    return overlay
 
 
 def gather_samples_from_split(split_name):
@@ -204,10 +218,12 @@ def save_split(split_name, samples):
     out_img_dir = OUT_ROOT / split_name / "images"
     out_mask_dir = OUT_ROOT / split_name / "masks"
     out_color_mask_dir = OUT_ROOT / split_name / "color_masks"
+    out_overlay_dir = OUT_ROOT / split_name / "overlays"
 
     ensure_dir(out_img_dir)
     ensure_dir(out_mask_dir)
     ensure_dir(out_color_mask_dir)
+    ensure_dir(out_overlay_dir)
 
     for idx, sample in enumerate(samples):
         image_path = sample["image_path"]
@@ -226,12 +242,14 @@ def save_split(split_name, samples):
             continue
 
         color_mask = colorize_mask(mask)
+        overlay = make_overlay(img, mask)
 
         file_name = f"{image_path.stem}_{idx:04d}.png"
 
         cv2.imwrite(str(out_img_dir / file_name), img)
         cv2.imwrite(str(out_mask_dir / file_name), mask)
         cv2.imwrite(str(out_color_mask_dir / file_name), color_mask)
+        cv2.imwrite(str(out_overlay_dir / file_name), overlay)
 
 
 def main():

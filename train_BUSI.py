@@ -228,7 +228,7 @@ if __name__ == "__main__":
     num_epochs = 300
     lr = 1e-4
     early_stopping_patience = 50
-    checkpoint_path = "files/checkpoint.pth"
+    checkpoint_path = "files/BUSI_checkpoint.pth"
     path = "dataset_seg"
 
     data_str = f"Image Size: {size}\nBatch Size: {batch_size}\nLR: {lr}\nEpochs: {num_epochs}\n"

@@ -264,7 +264,7 @@ if __name__ == "__main__":
     lr = 1e-4
     early_stopping_patience = 50
 
-    checkpoint_path = "files/checkpoint.pth"
+    checkpoint_path = "files/CBIS_checkpoint.pth"
     path = "dataset_seg"
 
     data_str = f"Image Size: {size}\nBatch Size: {batch_size}\nLR: {lr}\nEpochs: {num_epochs}\n"
