@@ -142,7 +142,6 @@ class DATASET(Dataset):
 
         image = np.transpose(image, (2, 0, 1))
         image = image.astype(np.float32) / 255.0
-        image = (image - 0.5) / 0.5
         image = torch.from_numpy(image).float()
 
         mask = mask.astype(np.int64)
