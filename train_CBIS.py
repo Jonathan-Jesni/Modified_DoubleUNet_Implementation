@@ -21,26 +21,38 @@ from model import build_doubleunet
 from metrics import CombinedLoss
 
 
+DEBUG_VIS_DIR = "files/debug_train_visuals"
+SAVE_DEBUG_EVERY_N_SAMPLES = 100
+
+
+def colorize_mask(mask):
+    color = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
+    color[mask == 1] = (0, 255, 0)   # benign = green
+    color[mask == 2] = (0, 0, 255)   # malignant = red
+    return color
+
+
+def save_debug_visual(image_rgb, mask, out_path):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    image_vis = image_rgb.copy()
+    if image_vis.max() <= 1:
+        image_vis = (image_vis * 255).astype(np.uint8)
+
+    mask_color = colorize_mask(mask)
+
+    overlay = image_vis.copy()
+    lesion = mask > 0
+    overlay[lesion] = (
+        image_vis[lesion].astype(np.float32) * 0.55
+        + mask_color[lesion].astype(np.float32) * 0.45
+    ).astype(np.uint8)
+
+    panel = np.concatenate([image_vis, mask_color, overlay], axis=1)
+    cv2.imwrite(out_path, panel)
+
+
 def load_data(path):
-    """
-    Expected dataset structure:
-    dataset_seg/
-        train/
-            images/*.png
-            masks/*.png
-        val/
-            images/*.png
-            masks/*.png
-        test/
-            images/*.png
-            masks/*.png
-
-    Masks must be class-index grayscale PNGs:
-        0 = background
-        1 = benign lesion pixels
-        2 = malignant lesion pixels
-    """
-
     def get_split_data(split_name):
         images = sorted(glob(os.path.join(path, split_name, "images", "*.png")))
         masks = sorted(glob(os.path.join(path, split_name, "masks", "*.png")))
@@ -51,13 +63,9 @@ def load_data(path):
     test_x, test_y = get_split_data("test")
 
     if len(train_x) == 0:
-        raise FileNotFoundError(
-            f"No training images found in: {os.path.join(path, 'train', 'images')}"
-        )
+        raise FileNotFoundError(f"No training images found in: {os.path.join(path, 'train', 'images')}")
     if len(valid_x) == 0:
-        raise FileNotFoundError(
-            f"No validation images found in: {os.path.join(path, 'val', 'images')}"
-        )
+        raise FileNotFoundError(f"No validation images found in: {os.path.join(path, 'val', 'images')}")
     if len(test_x) == 0:
         print("[INFO] No test images found. Test split will remain empty for now.")
 
@@ -84,47 +92,39 @@ class DATASET(Dataset):
         image_path = self.images_path[index]
         mask_path = self.masks_path[index]
 
-        # Read grayscale mammogram image
         image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
         if image is None:
             raise ValueError(f"Failed to read image: {image_path}")
 
-        # Optional mammogram contrast enhancement
-        # You may uncomment this later if the images look too flat.
-        # image = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(image)
-
-        # Repeat grayscale into 3 channels for pretrained encoder
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
 
-        # Read class-index mask:
-        # 0 = background, 1 = benign, 2 = malignant
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         if mask is None:
             raise ValueError(f"Failed to read mask: {mask_path}")
 
-        # Resize image and mask
         image = cv2.resize(image, self.size, interpolation=cv2.INTER_LINEAR)
         mask = cv2.resize(mask, self.size, interpolation=cv2.INTER_NEAREST)
-
-        # Safety check: keep only valid class IDs
         mask = np.clip(mask, 0, 2).astype(np.uint8)
 
-        # Augmentation
+        # Save pre-augmentation debug panel: image | colored GT mask | overlay
+        if index % SAVE_DEBUG_EVERY_N_SAMPLES == 0:
+            out_name = os.path.basename(image_path)
+            save_debug_visual(
+                image.copy(),
+                mask.copy(),
+                os.path.join(DEBUG_VIS_DIR, out_name)
+            )
+
         if self.transform is not None:
             augmented = self.transform(image=image, mask=mask)
             image = augmented["image"]
             mask = augmented["mask"]
 
-        # Image formatting: HWC -> CHW
         image = np.transpose(image, (2, 0, 1))
         image = image.astype(np.float32) / 255.0
-
-        # Mammogram-friendly normalization to [-1, 1]
         image = (image - 0.5) / 0.5
-
         image = torch.from_numpy(image).float()
 
-        # Multi-class mask formatting
         mask = mask.astype(np.int64)
         mask = torch.from_numpy(mask).long()
 
@@ -170,13 +170,15 @@ def train(model, loader, optimizer, loss_fn, device):
         epoch_recall += score[2]
         epoch_precision += score[3]
 
-    epoch_loss /= len(loader)
-    epoch_jac /= len(loader)
-    epoch_f1 /= len(loader)
-    epoch_recall /= len(loader)
-    epoch_precision /= len(loader)
-
-    return epoch_loss, [epoch_jac, epoch_f1, epoch_recall, epoch_precision]
+    return (
+        epoch_loss / len(loader),
+        [
+            epoch_jac / len(loader),
+            epoch_f1 / len(loader),
+            epoch_recall / len(loader),
+            epoch_precision / len(loader),
+        ],
+    )
 
 
 def evaluate(model, loader, loss_fn, device):
@@ -209,30 +211,31 @@ def evaluate(model, loader, loss_fn, device):
             epoch_recall += score[2]
             epoch_precision += score[3]
 
-    epoch_loss /= len(loader)
-    epoch_jac /= len(loader)
-    epoch_f1 /= len(loader)
-    epoch_recall /= len(loader)
-    epoch_precision /= len(loader)
-
-    return epoch_loss, [epoch_jac, epoch_f1, epoch_recall, epoch_precision]
+    return (
+        epoch_loss / len(loader),
+        [
+            epoch_jac / len(loader),
+            epoch_f1 / len(loader),
+            epoch_recall / len(loader),
+            epoch_precision / len(loader),
+        ],
+    )
 
 
 if __name__ == "__main__":
     seeding(42)
 
     create_dir("files")
+    create_dir(DEBUG_VIS_DIR)
 
     train_log_path = "files/train_log.txt"
     if not os.path.exists(train_log_path):
         with open(train_log_path, "w") as f:
             f.write("\n")
 
-    datetime_object = str(datetime.datetime.now())
-    print_and_save(train_log_path, datetime_object)
+    print_and_save(train_log_path, str(datetime.datetime.now()))
     print("")
 
-    # Hyperparameters
     image_size = 256
     size = (image_size, image_size)
 
@@ -249,24 +252,15 @@ if __name__ == "__main__":
     data_str += f"Dataset Path: {path}\n"
     print_and_save(train_log_path, data_str)
 
-    # Dataset
     (train_x, train_y), (valid_x, valid_y), (test_x, test_y) = load_data(path)
     train_x, train_y = shuffling(train_x, train_y)
 
-    data_str = (
-        f"Dataset Size:\n"
-        f"Train: {len(train_x)} - Valid: {len(valid_x)} - Test: {len(test_x)}\n"
-    )
+    data_str = f"Dataset Size:\nTrain: {len(train_x)} - Valid: {len(valid_x)} - Test: {len(test_x)}\n"
     print_and_save(train_log_path, data_str)
 
-    # Mammogram-safe augmentation
     transform = A.Compose([
         A.Rotate(limit=15, p=0.3, border_mode=cv2.BORDER_REFLECT_101),
         A.HorizontalFlip(p=0.5),
-
-        # Avoid vertical flip for mammograms unless you intentionally want it.
-        # A.VerticalFlip(p=0.2),
-
         A.CoarseDropout(
             num_holes_range=(1, 6),
             hole_height_range=(1, 20),
@@ -278,7 +272,7 @@ if __name__ == "__main__":
     train_dataset = DATASET(train_x, train_y, size, transform=transform)
     valid_dataset = DATASET(valid_x, valid_y, size, transform=None)
 
-    num_workers = 4 if os.name == "nt" else 4
+    num_workers = 4
     persistent_workers = num_workers > 0
 
     train_loader = DataLoader(
@@ -314,18 +308,12 @@ if __name__ == "__main__":
         model.load_state_dict(torch.load(checkpoint_path, map_location=device))
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        patience=5
-    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=5)
 
     loss_fn = CombinedLoss(num_classes=3)
     loss_name = "CrossEntropy + Multi-Class Dice Loss"
 
-    data_str = f"Optimizer: Adam\nLoss: {loss_name}\n"
-    print_and_save(train_log_path, data_str)
+    print_and_save(train_log_path, f"Optimizer: Adam\nLoss: {loss_name}\n")
 
     best_valid_f1 = 0.0
     early_stopping_count = 0
@@ -341,8 +329,7 @@ if __name__ == "__main__":
         if valid_metrics[1] > best_valid_f1:
             data_str = (
                 f"Valid F1 improved from {best_valid_f1:2.4f} "
-                f"to {valid_metrics[1]:2.4f}. "
-                f"Saving checkpoint: {checkpoint_path}"
+                f"to {valid_metrics[1]:2.4f}. Saving checkpoint: {checkpoint_path}"
             )
             print_and_save(train_log_path, data_str)
 
@@ -352,8 +339,7 @@ if __name__ == "__main__":
         else:
             early_stopping_count += 1
 
-        end_time = time.time()
-        epoch_mins, epoch_secs = epoch_time(start_time, end_time)
+        epoch_mins, epoch_secs = epoch_time(start_time, time.time())
 
         data_str = f"Epoch: {epoch + 1:02} | Epoch Time: {epoch_mins}m {epoch_secs}s\n"
         data_str += (
@@ -374,9 +360,8 @@ if __name__ == "__main__":
         print_and_save(train_log_path, data_str)
 
         if early_stopping_count >= early_stopping_patience:
-            data_str = (
-                f"Early stopping: validation F1 did not improve for "
-                f"{early_stopping_patience} consecutive epochs.\n"
+            print_and_save(
+                train_log_path,
+                f"Early stopping: validation F1 did not improve for {early_stopping_patience} consecutive epochs.\n"
             )
-            print_and_save(train_log_path, data_str)
             break

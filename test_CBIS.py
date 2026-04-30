@@ -38,12 +38,6 @@ def load_data(path):
 
 
 def process_mask(y_pred_classes):
-    """
-    For visualization only:
-    0 = background = black
-    1 = benign     = gray
-    2 = malignant  = white
-    """
     y_pred = y_pred_classes[0].detach().cpu().numpy()
     y_pred = (y_pred * 127).astype(np.uint8)
 
@@ -54,19 +48,26 @@ def process_mask(y_pred_classes):
 
 
 def colorize_mask(mask_classes):
-    """
-    Color visualization:
-    0 = background = black
-    1 = benign     = green
-    2 = malignant  = red
-    """
     h, w = mask_classes.shape
     color = np.zeros((h, w, 3), dtype=np.uint8)
 
-    color[mask_classes == 1] = (0, 255, 0)
-    color[mask_classes == 2] = (0, 0, 255)
+    color[mask_classes == 1] = (0, 255, 0)   # benign = green
+    color[mask_classes == 2] = (0, 0, 255)   # malignant = red
 
     return color
+
+
+def make_overlay(image_rgb, mask_classes, alpha=0.45):
+    mask_color = colorize_mask(mask_classes)
+    overlay = image_rgb.copy()
+
+    lesion = mask_classes > 0
+    overlay[lesion] = (
+        image_rgb[lesion].astype(np.float32) * (1 - alpha)
+        + mask_color[lesion].astype(np.float32) * alpha
+    ).astype(np.uint8)
+
+    return overlay
 
 
 def print_score(metrics_score, num_samples):
@@ -91,32 +92,20 @@ def evaluate(model, save_path, test_x, test_y, size, device):
     for i, (x, y) in tqdm(enumerate(zip(test_x, test_y)), total=len(test_x)):
         name = os.path.basename(x)
 
-        # =========================
-        # Image
-        # =========================
         image_gray = cv2.imread(x, cv2.IMREAD_GRAYSCALE)
         if image_gray is None:
             raise ValueError(f"Failed to read image: {x}")
 
         image_rgb = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2RGB)
         image_rgb = cv2.resize(image_rgb, size, interpolation=cv2.INTER_LINEAR)
-
         save_img = image_rgb.copy()
 
         image = image_rgb.astype(np.float32) / 255.0
         image = (image - 0.5) / 0.5
         image = np.transpose(image, (2, 0, 1))
         image = np.expand_dims(image, axis=0)
-
         image = torch.from_numpy(image).float().to(device)
 
-        # =========================
-        # Mask
-        # CBIS masks are already class-index masks:
-        # 0 = background
-        # 1 = benign
-        # 2 = malignant
-        # =========================
         mask_raw = cv2.imread(y, cv2.IMREAD_GRAYSCALE)
         if mask_raw is None:
             raise ValueError(f"Failed to read mask: {y}")
@@ -129,14 +118,13 @@ def evaluate(model, save_path, test_x, test_y, size, device):
         save_mask_gray = np.concatenate([save_mask_gray, save_mask_gray, save_mask_gray], axis=2)
 
         save_mask_color = colorize_mask(final_mask)
+        gt_overlay = make_overlay(save_img, final_mask)
 
         mask = torch.from_numpy(final_mask).long().unsqueeze(0).to(device)
 
         with torch.no_grad():
             start_time = time.time()
-
             y_pred1, y_pred2 = model(image)
-
             end_time = time.time() - start_time
             time_taken.append(end_time)
 
@@ -157,8 +145,13 @@ def evaluate(model, save_path, test_x, test_y, size, device):
             y_pred1_img = process_mask(y_pred1_classes)
             y_pred2_img = process_mask(y_pred2_classes)
 
-            y_pred1_color = colorize_mask(y_pred1_classes[0].detach().cpu().numpy())
-            y_pred2_color = colorize_mask(y_pred2_classes[0].detach().cpu().numpy())
+            y_pred1_np = y_pred1_classes[0].detach().cpu().numpy()
+            y_pred2_np = y_pred2_classes[0].detach().cpu().numpy()
+
+            y_pred1_color = colorize_mask(y_pred1_np)
+            y_pred2_color = colorize_mask(y_pred2_np)
+
+            pred_overlay = make_overlay(save_img, y_pred2_np)
 
         line = np.ones((size[1], 10, 3), dtype=np.uint8) * 255
 
@@ -172,8 +165,18 @@ def evaluate(model, save_path, test_x, test_y, size, device):
             axis=1
         )
 
+        joint_overlay = np.concatenate(
+            [save_img, line, gt_overlay, line, pred_overlay],
+            axis=1
+        )
+
         cv2.imwrite(f"{save_path}/joint_gray/{name}", joint_gray)
         cv2.imwrite(f"{save_path}/joint_color/{name}", joint_color)
+        cv2.imwrite(f"{save_path}/joint_overlay/{name}", joint_overlay)
+
+        cv2.imwrite(f"{save_path}/gt_overlay/{name}", gt_overlay)
+        cv2.imwrite(f"{save_path}/pred_overlay/{name}", pred_overlay)
+
         cv2.imwrite(f"{save_path}/mask1/{name}", y_pred1_img)
         cv2.imwrite(f"{save_path}/mask2/{name}", y_pred2_img)
         cv2.imwrite(f"{save_path}/mask1_color/{name}", y_pred1_color)
@@ -222,9 +225,11 @@ if __name__ == "__main__":
         "mask2_color",
         "joint_gray",
         "joint_color",
+        "joint_overlay",
+        "gt_overlay",
+        "pred_overlay",
     ]:
         create_dir(f"{save_path}/{item}")
 
     size = (256, 256)
-
     evaluate(model, save_path, test_x, test_y, size, device)
