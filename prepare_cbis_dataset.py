@@ -28,9 +28,24 @@ def ensure_dir(path: Path):
 def clean_output():
     if OUT_ROOT.exists():
         shutil.rmtree(OUT_ROOT)
+
     for split in ["train", "val", "test"]:
         ensure_dir(OUT_ROOT / split / "images")
-        ensure_dir(OUT_ROOT / split / "masks")
+        ensure_dir(OUT_ROOT / split / "masks")          # grayscale 0/1/2 for training
+        ensure_dir(OUT_ROOT / split / "masks_color")    # colored copy for viewing
+
+
+def colorize_mask(mask):
+    """
+    Visualization only:
+        0 = background = black
+        1 = benign     = green
+        2 = malignant  = red
+    """
+    color = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
+    color[mask == 1] = (0, 255, 0)
+    color[mask == 2] = (0, 0, 255)
+    return color
 
 
 def norm_text(x):
@@ -38,17 +53,12 @@ def norm_text(x):
 
 
 def find_jpeg_from_path(path_text):
-    """
-    CSV paths usually contain DICOM-style folder/file hints.
-    This function searches the jpeg folder using the last useful path parts.
-    """
     path_text = norm_text(path_text)
     if not path_text:
         return None
 
     parts = [p for p in path_text.split("/") if p]
 
-    # Try UID folder match
     for part in reversed(parts):
         candidate_dir = JPEG_ROOT / part
         if candidate_dir.exists():
@@ -56,7 +66,6 @@ def find_jpeg_from_path(path_text):
             if jpgs:
                 return jpgs[0]
 
-    # Fallback: try filename stem contains
     last = Path(parts[-1]).stem if parts else ""
     if last:
         matches = sorted(JPEG_ROOT.rglob(f"*{last}*.jpg"))
@@ -70,6 +79,7 @@ def read_mask(mask_path):
     m = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
     if m is None:
         return None
+
     return (m > 0).astype(np.uint8)
 
 
@@ -82,7 +92,11 @@ def build_multiclass_mask(mask_paths, class_id, target_shape):
             continue
 
         if m.shape != target_shape:
-            m = cv2.resize(m, (target_shape[1], target_shape[0]), interpolation=cv2.INTER_NEAREST)
+            m = cv2.resize(
+                m,
+                (target_shape[1], target_shape[0]),
+                interpolation=cv2.INTER_NEAREST
+            )
 
         final[m > 0] = class_id
 
@@ -98,6 +112,7 @@ def load_case_csvs():
     ]
 
     dfs = []
+
     for f in files:
         if not f.exists():
             print(f"[WARN] Missing CSV: {f}")
@@ -115,10 +130,12 @@ def load_case_csvs():
 
 def pick_column(df, possible_names):
     cols = {c.lower().strip(): c for c in df.columns}
+
     for name in possible_names:
         key = name.lower().strip()
         if key in cols:
             return cols[key]
+
     return None
 
 
@@ -138,6 +155,7 @@ def gather_samples():
 
     for row_idx, row in df.iterrows():
         pathology = str(row[pathology_col]).strip().upper()
+
         if pathology not in CLASS_MAP:
             continue
 
@@ -179,9 +197,11 @@ def gather_samples():
 def save_split(split_name, samples):
     out_img_dir = OUT_ROOT / split_name / "images"
     out_mask_dir = OUT_ROOT / split_name / "masks"
+    out_mask_color_dir = OUT_ROOT / split_name / "masks_color"
 
     for idx, s in enumerate(samples):
         img = cv2.imread(str(s["image_path"]), cv2.IMREAD_GRAYSCALE)
+
         if img is None:
             print(f"[WARN] Could not read image: {s['image_path']}")
             continue
@@ -192,22 +212,36 @@ def save_split(split_name, samples):
             target_shape=img.shape,
         )
 
+        mask_color = colorize_mask(mask)
+
         prefix = "benign" if s["class_id"] == 1 else "malignant"
         safe_patient = s["patient_id"].replace("/", "_").replace("\\", "_")
         name = f"{prefix}_{safe_patient}_{idx:05d}.png"
 
         cv2.imwrite(str(out_img_dir / name), img)
+
+        # Training mask: keep as grayscale class IDs 0/1/2
         cv2.imwrite(str(out_mask_dir / name), mask)
+
+        # Visualization mask: colored copy only
+        cv2.imwrite(str(out_mask_color_dir / name), mask_color)
 
 
 def patientwise_split(samples):
     patients = sorted(list({s["patient_id"] for s in samples}))
 
     train_p, temp_p = train_test_split(
-        patients, test_size=0.20, random_state=RANDOM_STATE, shuffle=True
+        patients,
+        test_size=0.20,
+        random_state=RANDOM_STATE,
+        shuffle=True
     )
+
     val_p, test_p = train_test_split(
-        temp_p, test_size=0.50, random_state=RANDOM_STATE, shuffle=True
+        temp_p,
+        test_size=0.50,
+        random_state=RANDOM_STATE,
+        shuffle=True
     )
 
     train_p, val_p, test_p = set(train_p), set(val_p), set(test_p)
@@ -223,10 +257,12 @@ def main():
     clean_output()
 
     samples = gather_samples()
+
     print(f"Total usable ROI samples: {len(samples)}")
 
     benign = sum(1 for s in samples if s["class_id"] == 1)
     malignant = sum(1 for s in samples if s["class_id"] == 2)
+
     print(f"Benign samples   : {benign}")
     print(f"Malignant samples: {malignant}")
 
@@ -241,6 +277,8 @@ def main():
     save_split("test", test_s)
 
     print(f"\nFinished. Output at: {OUT_ROOT.resolve()}")
+    print("Training masks saved in: dataset_seg/<split>/masks")
+    print("Colored masks saved in : dataset_seg/<split>/masks_color")
 
 
 if __name__ == "__main__":
