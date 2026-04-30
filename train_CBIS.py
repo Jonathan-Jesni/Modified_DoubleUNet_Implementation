@@ -63,34 +63,30 @@ def load_data(path):
         images = sorted(glob(os.path.join(img_dir, "*.png")))
         masks = sorted(glob(os.path.join(mask_dir, "*.png")))
 
+        # Pair safely
         image_dict = {os.path.basename(x): x for x in images}
         mask_dict = {os.path.basename(y): y for y in masks}
 
         common_names = sorted(set(image_dict.keys()) & set(mask_dict.keys()))
 
-        paired_images = [image_dict[name] for name in common_names]
-        paired_masks = [mask_dict[name] for name in common_names]
+        paired_images = []
+        paired_masks = []
 
-        missing_masks = sorted(set(image_dict.keys()) - set(mask_dict.keys()))
-        missing_images = sorted(set(mask_dict.keys()) - set(image_dict.keys()))
+        for name in common_names:
+            # 🔥 MASS FILTER HERE
+            if "mass" not in name.lower():
+                continue
 
-        if missing_masks:
-            print(f"[WARN] {split_name}: {len(missing_masks)} images have no matching mask.")
-        if missing_images:
-            print(f"[WARN] {split_name}: {len(missing_images)} masks have no matching image.")
+            paired_images.append(image_dict[name])
+            paired_masks.append(mask_dict[name])
+
+        print(f"[INFO] {split_name}: MASS samples = {len(paired_images)}")
 
         return paired_images, paired_masks
 
     train_x, train_y = get_split_data("train")
     valid_x, valid_y = get_split_data("val")
     test_x, test_y = get_split_data("test")
-
-    if len(train_x) == 0:
-        raise FileNotFoundError(f"No training image/mask pairs found in: {os.path.join(path, 'train')}")
-    if len(valid_x) == 0:
-        raise FileNotFoundError(f"No validation image/mask pairs found in: {os.path.join(path, 'val')}")
-    if len(test_x) == 0:
-        print("[INFO] No test image/mask pairs found. Test split will remain empty for now.")
 
     return [(train_x, train_y), (valid_x, valid_y), (test_x, test_y)]
 
