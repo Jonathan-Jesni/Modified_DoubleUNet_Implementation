@@ -16,9 +16,17 @@ from utils import create_dir, seeding
 
 NUM_CLASSES = 3
 SIZE = (256, 256)
+
 DATASET_PATH = "dataset_seg_CBIS"
-CHECKPOINT_PATH = "files/CBIS_checkpoint.pth"
+CHECKPOINT_PATH = "files/CBIS_checkpoint.pth.zip"
 SAVE_PATH = "results_CBIS"
+
+
+COLOR_MAP = {
+    0: (0, 0, 0),       # background = black
+    1: (0, 255, 0),     # benign = green
+    2: (0, 0, 255),     # malignant = red
+}
 
 
 def load_data(path):
@@ -43,16 +51,44 @@ def load_data(path):
     valid_x, valid_y = get_split_data("val")
     test_x, test_y = get_split_data("test")
 
-    return [(train_x, train_y), (valid_x, valid_y), (test_x, test_y)]
+    return (train_x, train_y), (valid_x, valid_y), (test_x, test_y)
+
+
+def class_to_gray(mask):
+    mask = (mask * 127).astype(np.uint8)
+    mask = np.expand_dims(mask, axis=-1)
+    mask = np.concatenate([mask, mask, mask], axis=2)
+    return mask
+
+
+def class_to_color(mask):
+    color_mask = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
+
+    for class_id, color in COLOR_MAP.items():
+        color_mask[mask == class_id] = color
+
+    return color_mask
+
+
+def make_overlay(image_rgb, mask_classes, alpha=0.45):
+    mask_color = class_to_color(mask_classes)
+    overlay = image_rgb.copy()
+
+    lesion = mask_classes > 0
+
+    overlay[lesion] = (
+        image_rgb[lesion].astype(np.float32) * (1 - alpha)
+        + mask_color[lesion].astype(np.float32) * alpha
+    ).astype(np.uint8)
+
+    return overlay
 
 
 def calculate_multiclass_metrics(y_true, y_pred, num_classes=3):
     """
-    Macro metrics over foreground classes only:
-      class 1 = benign
-      class 2 = malignant
-
-    Background is excluded from averaged score.
+    Macro-average over foreground classes only:
+    class 1 = benign
+    class 2 = malignant
     """
     y_true = y_true.detach().cpu().numpy().astype(np.uint8)
     y_pred = y_pred.detach().cpu().numpy().astype(np.uint8)
@@ -63,8 +99,8 @@ def calculate_multiclass_metrics(y_true, y_pred, num_classes=3):
     precisions = []
 
     for cls in range(1, num_classes):
-        true_cls = (y_true == cls)
-        pred_cls = (y_pred == cls)
+        true_cls = y_true == cls
+        pred_cls = y_pred == cls
 
         tp = np.logical_and(true_cls, pred_cls).sum()
         fp = np.logical_and(~true_cls, pred_cls).sum()
@@ -94,35 +130,30 @@ def calculate_multiclass_metrics(y_true, y_pred, num_classes=3):
     ]
 
 
-def colorize_mask(mask_classes):
-    h, w = mask_classes.shape
-    color = np.zeros((h, w, 3), dtype=np.uint8)
+def dice_per_class(pred, target, class_id, eps=1e-7):
+    pred_c = pred == class_id
+    target_c = target == class_id
 
-    color[mask_classes == 1] = (0, 255, 0)      # benign = green
-    color[mask_classes == 2] = (0, 0, 255)      # malignant = red
+    intersection = np.logical_and(pred_c, target_c).sum()
+    total = pred_c.sum() + target_c.sum()
 
-    return color
+    if total == 0:
+        return np.nan
 
-
-def gray_mask(mask_classes):
-    out = (mask_classes * 127).astype(np.uint8)
-    out = np.expand_dims(out, axis=-1)
-    out = np.concatenate([out, out, out], axis=2)
-    return out
+    return (2 * intersection + eps) / (total + eps)
 
 
-def make_overlay(image_rgb, mask_classes, alpha=0.45):
-    mask_color = colorize_mask(mask_classes)
-    overlay = image_rgb.copy()
+def iou_per_class(pred, target, class_id, eps=1e-7):
+    pred_c = pred == class_id
+    target_c = target == class_id
 
-    lesion = mask_classes > 0
+    intersection = np.logical_and(pred_c, target_c).sum()
+    union = np.logical_or(pred_c, target_c).sum()
 
-    overlay[lesion] = (
-        image_rgb[lesion].astype(np.float32) * (1 - alpha)
-        + mask_color[lesion].astype(np.float32) * alpha
-    ).astype(np.uint8)
+    if union == 0:
+        return np.nan
 
-    return overlay
+    return (intersection + eps) / (union + eps)
 
 
 def print_score(metrics_score, num_samples):
@@ -132,8 +163,8 @@ def print_score(metrics_score, num_samples):
     precision = metrics_score[3] / num_samples
 
     print(
-        f"Jaccard: {jaccard:1.4f} - "
-        f"F1/Dice: {f1:1.4f} - "
+        f"Jaccard/IoU: {jaccard:1.4f} - "
+        f"Dice/F1: {f1:1.4f} - "
         f"Recall: {recall:1.4f} - "
         f"Precision: {precision:1.4f}"
     )
@@ -142,72 +173,112 @@ def print_score(metrics_score, num_samples):
 def evaluate(model, save_path, test_x, test_y, size, device):
     metrics_score_1 = [0.0, 0.0, 0.0, 0.0]
     metrics_score_2 = [0.0, 0.0, 0.0, 0.0]
+
+    class_dice = {0: [], 1: [], 2: []}
+    class_iou = {0: [], 1: [], 2: []}
+
     time_taken = []
 
     for i, (x, y) in tqdm(enumerate(zip(test_x, test_y)), total=len(test_x)):
         name = os.path.basename(x)
 
+        # ---------------- Image ----------------
         image_gray = cv2.imread(x, cv2.IMREAD_GRAYSCALE)
+
         if image_gray is None:
             raise ValueError(f"Failed to read image: {x}")
 
         image_gray = cv2.resize(image_gray, size, interpolation=cv2.INTER_LINEAR)
         image_rgb = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2RGB)
+
         save_img = image_rgb.copy()
 
         image = image_rgb.astype(np.float32) / 255.0
+
+        # Keep this normalization because CBIS training likely used it
         image = (image - 0.5) / 0.5
+
         image = np.transpose(image, (2, 0, 1))
         image = np.expand_dims(image, axis=0)
-        image = torch.from_numpy(image).float().to(device)
 
+        image_tensor = torch.from_numpy(image).float().to(device)
+
+        # ---------------- Mask ----------------
         mask_raw = cv2.imread(y, cv2.IMREAD_GRAYSCALE)
+
         if mask_raw is None:
             raise ValueError(f"Failed to read mask: {y}")
 
         mask_raw = cv2.resize(mask_raw, size, interpolation=cv2.INTER_NEAREST)
+
+        # Expected prepared CBIS mask values:
+        # 0 = background, 1 = benign, 2 = malignant
         final_mask = np.clip(mask_raw, 0, 2).astype(np.uint8)
 
-        mask = torch.from_numpy(final_mask).long().to(device)
+        mask_tensor = torch.from_numpy(final_mask).long().to(device)
 
         with torch.no_grad():
             start_time = time.time()
-            y_pred1, y_pred2 = model(image)
+
+            y_pred1, y_pred2 = model(image_tensor)
+
             end_time = time.time() - start_time
             time_taken.append(end_time)
 
-            y_pred1_classes = torch.argmax(torch.softmax(y_pred1, dim=1), dim=1)[0]
-            y_pred2_classes = torch.argmax(torch.softmax(y_pred2, dim=1), dim=1)[0]
+            y_pred1 = torch.softmax(y_pred1, dim=1)
+            y_pred2 = torch.softmax(y_pred2, dim=1)
 
-            score_1 = calculate_multiclass_metrics(mask, y_pred1_classes, NUM_CLASSES)
-            score_2 = calculate_multiclass_metrics(mask, y_pred2_classes, NUM_CLASSES)
+            y_pred1_classes = torch.argmax(y_pred1, dim=1)[0]
+            y_pred2_classes = torch.argmax(y_pred2, dim=1)[0]
+
+            score_1 = calculate_multiclass_metrics(
+                mask_tensor,
+                y_pred1_classes,
+                NUM_CLASSES
+            )
+
+            score_2 = calculate_multiclass_metrics(
+                mask_tensor,
+                y_pred2_classes,
+                NUM_CLASSES
+            )
 
             metrics_score_1 = list(map(add, metrics_score_1, score_1))
             metrics_score_2 = list(map(add, metrics_score_2, score_2))
 
-            y_pred1_np = y_pred1_classes.detach().cpu().numpy().astype(np.uint8)
-            y_pred2_np = y_pred2_classes.detach().cpu().numpy().astype(np.uint8)
+            pred1_np = y_pred1_classes.detach().cpu().numpy().astype(np.uint8)
+            pred2_np = y_pred2_classes.detach().cpu().numpy().astype(np.uint8)
 
-        save_mask_gray = gray_mask(final_mask)
-        y_pred1_gray = gray_mask(y_pred1_np)
-        y_pred2_gray = gray_mask(y_pred2_np)
+            for class_id in [0, 1, 2]:
+                d = dice_per_class(pred2_np, final_mask, class_id)
+                j = iou_per_class(pred2_np, final_mask, class_id)
 
-        save_mask_color = colorize_mask(final_mask)
-        y_pred1_color = colorize_mask(y_pred1_np)
-        y_pred2_color = colorize_mask(y_pred2_np)
+                if not np.isnan(d):
+                    class_dice[class_id].append(d)
+                if not np.isnan(j):
+                    class_iou[class_id].append(j)
+
+        # ---------------- Visual Outputs ----------------
+        gt_gray = class_to_gray(final_mask)
+        pred1_gray = class_to_gray(pred1_np)
+        pred2_gray = class_to_gray(pred2_np)
+
+        gt_color = class_to_color(final_mask)
+        pred1_color = class_to_color(pred1_np)
+        pred2_color = class_to_color(pred2_np)
 
         gt_overlay = make_overlay(save_img, final_mask)
-        pred_overlay = make_overlay(save_img, y_pred2_np)
+        pred_overlay = make_overlay(save_img, pred2_np)
 
         line = np.ones((size[1], 10, 3), dtype=np.uint8) * 255
 
         joint_gray = np.concatenate(
-            [save_img, line, save_mask_gray, line, y_pred1_gray, line, y_pred2_gray],
+            [save_img, line, gt_gray, line, pred1_gray, line, pred2_gray],
             axis=1
         )
 
         joint_color = np.concatenate(
-            [save_img, line, save_mask_color, line, y_pred1_color, line, y_pred2_color],
+            [save_img, line, gt_color, line, pred1_color, line, pred2_color],
             axis=1
         )
 
@@ -223,21 +294,37 @@ def evaluate(model, save_path, test_x, test_y, size, device):
         cv2.imwrite(f"{save_path}/gt_overlay/{name}", gt_overlay)
         cv2.imwrite(f"{save_path}/pred_overlay/{name}", pred_overlay)
 
-        cv2.imwrite(f"{save_path}/mask1/{name}", y_pred1_gray)
-        cv2.imwrite(f"{save_path}/mask2/{name}", y_pred2_gray)
-        cv2.imwrite(f"{save_path}/mask1_color/{name}", y_pred1_color)
-        cv2.imwrite(f"{save_path}/mask2_color/{name}", y_pred2_color)
+        cv2.imwrite(f"{save_path}/mask1_gray/{name}", pred1_gray)
+        cv2.imwrite(f"{save_path}/mask2_gray/{name}", pred2_gray)
 
-    print("--- Output 1 Scores ---")
+        cv2.imwrite(f"{save_path}/mask1_color/{name}", pred1_color)
+        cv2.imwrite(f"{save_path}/mask2_color/{name}", pred2_color)
+
+    print("\n--- Output 1 Scores ---")
     print_score(metrics_score_1, len(test_x))
 
-    print("--- Output 2 Scores / Final Output ---")
+    print("\n--- Output 2 Scores Final Output ---")
     print_score(metrics_score_2, len(test_x))
+
+    print("\n--- Per-Class Final Output Scores ---")
+
+    class_names = {
+        0: "Background",
+        1: "Benign lesion",
+        2: "Malignant lesion",
+    }
+
+    for class_id, class_name in class_names.items():
+        mean_dice = np.mean(class_dice[class_id]) if class_dice[class_id] else 0.0
+        mean_iou = np.mean(class_iou[class_id]) if class_iou[class_id] else 0.0
+
+        print(f"{class_name}: Dice = {mean_dice:.4f}, IoU = {mean_iou:.4f}")
 
     mean_time_taken = np.mean(time_taken)
     mean_fps = 1 / mean_time_taken
 
-    print(f"Mean FPS: {mean_fps:1.2f}")
+    print(f"\nMean FPS: {mean_fps:1.2f}")
+    print(f"Results saved at: {save_path}")
 
 
 if __name__ == "__main__":
@@ -252,7 +339,13 @@ if __name__ == "__main__":
     if not os.path.exists(CHECKPOINT_PATH):
         raise FileNotFoundError(f"Checkpoint not found: {CHECKPOINT_PATH}")
 
-    model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    else:
+        model.load_state_dict(checkpoint)
+
     model.eval()
 
     (train_x, train_y), (valid_x, valid_y), (test_x, test_y) = load_data(DATASET_PATH)
@@ -266,8 +359,8 @@ if __name__ == "__main__":
         raise RuntimeError("No test images found. Run CBIS_prepare.py first.")
 
     for item in [
-        "mask1",
-        "mask2",
+        "mask1_gray",
+        "mask2_gray",
         "mask1_color",
         "mask2_color",
         "joint_gray",

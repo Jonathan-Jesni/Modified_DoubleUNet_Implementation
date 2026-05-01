@@ -70,7 +70,8 @@ models/
 saved_models/
 runs/
 outputs/
-results/
+results_BUSI/
+results_CBIS/
 files/
 
 # ==================================================
