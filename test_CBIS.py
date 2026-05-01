@@ -29,6 +29,18 @@ COLOR_MAP = {
 }
 
 
+def print_model_parameters(model):
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    non_trainable_params = total_params - trainable_params
+
+    print("\n================ MODEL INFO ================")
+    print(f"Total Parameters        : {total_params:,}")
+    print(f"Trainable Parameters    : {trainable_params:,}")
+    print(f"Non-trainable Parameters: {non_trainable_params:,}")
+    print("===========================================\n")
+
+
 def load_data(path):
     def get_split_data(split_name):
         img_dir = os.path.join(path, split_name, "images")
@@ -85,11 +97,6 @@ def make_overlay(image_rgb, mask_classes, alpha=0.45):
 
 
 def calculate_multiclass_metrics(y_true, y_pred, num_classes=3):
-    """
-    Macro-average over foreground classes only:
-    class 1 = benign
-    class 2 = malignant
-    """
     y_true = y_true.detach().cpu().numpy().astype(np.uint8)
     y_pred = y_pred.detach().cpu().numpy().astype(np.uint8)
 
@@ -182,7 +189,6 @@ def evaluate(model, save_path, test_x, test_y, size, device):
     for i, (x, y) in tqdm(enumerate(zip(test_x, test_y)), total=len(test_x)):
         name = os.path.basename(x)
 
-        # ---------------- Image ----------------
         image_gray = cv2.imread(x, cv2.IMREAD_GRAYSCALE)
 
         if image_gray is None:
@@ -194,16 +200,12 @@ def evaluate(model, save_path, test_x, test_y, size, device):
         save_img = image_rgb.copy()
 
         image = image_rgb.astype(np.float32) / 255.0
-
-        # Keep this normalization because CBIS training likely used it
         image = (image - 0.5) / 0.5
-
         image = np.transpose(image, (2, 0, 1))
         image = np.expand_dims(image, axis=0)
 
         image_tensor = torch.from_numpy(image).float().to(device)
 
-        # ---------------- Mask ----------------
         mask_raw = cv2.imread(y, cv2.IMREAD_GRAYSCALE)
 
         if mask_raw is None:
@@ -211,10 +213,7 @@ def evaluate(model, save_path, test_x, test_y, size, device):
 
         mask_raw = cv2.resize(mask_raw, size, interpolation=cv2.INTER_NEAREST)
 
-        # Expected prepared CBIS mask values:
-        # 0 = background, 1 = benign, 2 = malignant
         final_mask = np.clip(mask_raw, 0, 2).astype(np.uint8)
-
         mask_tensor = torch.from_numpy(final_mask).long().to(device)
 
         with torch.no_grad():
@@ -231,17 +230,8 @@ def evaluate(model, save_path, test_x, test_y, size, device):
             y_pred1_classes = torch.argmax(y_pred1, dim=1)[0]
             y_pred2_classes = torch.argmax(y_pred2, dim=1)[0]
 
-            score_1 = calculate_multiclass_metrics(
-                mask_tensor,
-                y_pred1_classes,
-                NUM_CLASSES
-            )
-
-            score_2 = calculate_multiclass_metrics(
-                mask_tensor,
-                y_pred2_classes,
-                NUM_CLASSES
-            )
+            score_1 = calculate_multiclass_metrics(mask_tensor, y_pred1_classes, NUM_CLASSES)
+            score_2 = calculate_multiclass_metrics(mask_tensor, y_pred2_classes, NUM_CLASSES)
 
             metrics_score_1 = list(map(add, metrics_score_1, score_1))
             metrics_score_2 = list(map(add, metrics_score_2, score_2))
@@ -258,7 +248,6 @@ def evaluate(model, save_path, test_x, test_y, size, device):
                 if not np.isnan(j):
                     class_iou[class_id].append(j)
 
-        # ---------------- Visual Outputs ----------------
         gt_gray = class_to_gray(final_mask)
         pred1_gray = class_to_gray(pred1_np)
         pred2_gray = class_to_gray(pred2_np)
@@ -335,6 +324,8 @@ if __name__ == "__main__":
 
     model = build_doubleunet()
     model = model.to(device)
+
+    print_model_parameters(model)
 
     if not os.path.exists(CHECKPOINT_PATH):
         raise FileNotFoundError(f"Checkpoint not found: {CHECKPOINT_PATH}")

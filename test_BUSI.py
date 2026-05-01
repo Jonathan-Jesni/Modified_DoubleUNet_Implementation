@@ -19,6 +19,18 @@ COLOR_MAP = {
 }
 
 
+def print_model_parameters(model):
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    non_trainable_params = total_params - trainable_params
+
+    print("\n================ MODEL INFO ================")
+    print(f"Total Parameters        : {total_params:,}")
+    print(f"Trainable Parameters    : {trainable_params:,}")
+    print(f"Non-trainable Parameters: {non_trainable_params:,}")
+    print("===========================================\n")
+
+
 def class_to_gray(mask):
     mask = (mask * 127).astype(np.uint8)
     mask = np.expand_dims(mask, axis=-1)
@@ -116,7 +128,6 @@ def evaluate(model, save_path, test_x, test_y, size, device):
         else:
             final_mask[tumor_pixels] = 0
 
-        save_mask_gray = class_to_gray(final_mask)
         save_mask_color = class_to_color(final_mask)
 
         mask_tensor = torch.from_numpy(final_mask).long().unsqueeze(0).to(device)
@@ -220,11 +231,19 @@ if __name__ == "__main__":
     seeding(42)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Device: {device}")
 
     model = build_doubleunet()
     model = model.to(device)
 
+    # Print parameter count before loading checkpoint
+    print_model_parameters(model)
+
     checkpoint_path = "files/BUSI_checkpoint.pth.zip"
+
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
@@ -236,6 +255,11 @@ if __name__ == "__main__":
 
     path = "dataset_seg_BUSI"
     (train_x, train_y), (valid_x, valid_y), (test_x, test_y) = load_data(path)
+
+    print(f"Train images: {len(train_x)}")
+    print(f"Val images  : {len(valid_x)}")
+    print(f"Test images : {len(test_x)}")
+    print(f"Test masks  : {len(test_y)}")
 
     save_path = "results_BUSI"
 
