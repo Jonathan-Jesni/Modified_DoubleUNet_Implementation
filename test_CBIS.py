@@ -199,8 +199,10 @@ def evaluate(model, save_path, test_x, test_y, size, device):
 
         save_img = image_rgb.copy()
 
+        # FIXED: Just divide by 255.0 to match training normalizer
         image = image_rgb.astype(np.float32) / 255.0
-        image = (image - 0.5) / 0.5
+        # REMOVED: image = (image - 0.5) / 0.5 
+        
         image = np.transpose(image, (2, 0, 1))
         image = np.expand_dims(image, axis=0)
 
@@ -341,13 +343,22 @@ if __name__ == "__main__":
 
     (train_x, train_y), (valid_x, valid_y), (test_x, test_y) = load_data(DATASET_PATH)
 
+    # ADDED: Filter only MASS images for test evaluation to match predictions
+    test_x_filtered, test_y_filtered = [], []
+    for tx, ty in zip(test_x, test_y):
+        if "mass" in os.path.basename(tx).lower():
+            test_x_filtered.append(tx)
+            test_y_filtered.append(ty)
+            
+    test_x, test_y = test_x_filtered, test_y_filtered
+
     print(f"Train images: {len(train_x)}")
     print(f"Val images  : {len(valid_x)}")
-    print(f"Test images : {len(test_x)}")
-    print(f"Test masks  : {len(test_y)}")
+    print(f"Test images : {len(test_x)} (Filtered for MASS)")
+    print(f"Test masks  : {len(test_y)} (Filtered for MASS)")
 
     if len(test_x) == 0:
-        raise RuntimeError("No test images found. Run CBIS_prepare.py first.")
+        raise RuntimeError("No MASS test images found.")
 
     for item in [
         "mask1_gray",

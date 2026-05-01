@@ -14,7 +14,7 @@ CHECKPOINT_PATH = "files/CBIS_checkpoint.pth.zip"
 IMAGE_DIR = "dataset_seg_CBIS/test/images"
 MASK_DIR = "dataset_seg_CBIS/test/masks"
 
-OUTPUT_DIR = "files/predictions"
+OUTPUT_DIR = "files/predictions_CBIS"
 MASK_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "pred_masks")
 PROB_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "prob_maps")
 OVERLAY_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "overlays")
@@ -75,17 +75,18 @@ def load_image(image_path, size):
     if image is None:
         raise ValueError(f"Failed to read image: {image_path}")
 
-    original_gray = image.copy()
+    # Resize to 256x256 immediately so the visualization matches prediction size
+    image_resized = cv2.resize(image, size)
+    image_rgb = cv2.cvtColor(image_resized, cv2.COLOR_GRAY2RGB)
 
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-    image_resized = cv2.resize(image_rgb, size)
-
-    image_norm = image_resized.astype(np.float32) / 255.0
-    image_norm = (image_norm - 0.5) / 0.5
+    # FIXED: Just divide by 255.0. 
+    # REMOVED: (image_norm - 0.5) / 0.5
+    image_norm = image_rgb.astype(np.float32) / 255.0
 
     image_tensor = torch.from_numpy(np.transpose(image_norm, (2, 0, 1))).unsqueeze(0).float()
 
-    return original_gray, image_resized, image_tensor
+    # Return the resized grayscale version for the panel visualization
+    return image_resized, image_resized, image_tensor
 
 
 def load_gt_mask(mask_path, size):
@@ -126,23 +127,17 @@ def make_overlay(base_gray, mask, alpha=0.45):
 
 
 def make_panel(img, gt, prob, pred, metrics, name):
-    # Resize raw image to match the standard size (256x256)
-    base = cv2.resize(img, IMAGE_SIZE)
-    base = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
-    
+    # 'img' is now 256x256 from the updated load_image above
+    base = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     gt_col = colorize_mask(gt)
     pred_col = colorize_mask(pred)
     
-    # Ensure prob visualization is colored and the same size
+    # Use a Heatmap for the probability map so it looks professional
     prob_col = cv2.applyColorMap(prob, cv2.COLORMAP_JET)
-    prob_col = cv2.resize(prob_col, IMAGE_SIZE)
 
-    # Overlays are already generated at mask size in make_overlay
-    gt_overlay = make_overlay(img, gt)
-    pred_overlay = make_overlay(img, pred)
-
+    # Now all components are identical in size (256, 256, 3)
     top = np.hstack([base, gt_col, prob_col])
-    bottom = np.hstack([pred_col, gt_overlay, pred_overlay])
+    bottom = np.hstack([pred_col, make_overlay(img, gt), make_overlay(img, pred)])
 
     return np.vstack([top, bottom])
 

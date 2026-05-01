@@ -18,7 +18,7 @@ CHECKPOINT_PATH = "files/BUSI_checkpoint.pth.zip"
 IMAGE_DIR = "dataset_seg_BUSI/test/images"
 MASK_DIR = "dataset_seg_BUSI/test/masks"
 
-OUTPUT_DIR = "files/predictions"
+OUTPUT_DIR = "files/predictions_BUSI"
 MASK_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "pred_masks")
 PROB_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "prob_maps")
 OVERLAY_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "overlays")
