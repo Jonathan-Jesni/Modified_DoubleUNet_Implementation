@@ -108,27 +108,41 @@ def colorize_mask(mask):
 
 
 def make_overlay(base_gray, mask, alpha=0.45):
-    base = cv2.cvtColor(base_gray, cv2.COLOR_GRAY2BGR)
+    # Resize the high-res original image to match the 256x256 mask
+    base_resized = cv2.resize(base_gray, (mask.shape[1], mask.shape[0]))
+    base = cv2.cvtColor(base_resized, cv2.COLOR_GRAY2BGR)
+    
     mask_color = colorize_mask(mask)
-
     overlay = base.copy()
     lesion = mask > 0
 
+    # Ensure float math for blending to avoid overflow/underflow
     overlay[lesion] = (
-        base[lesion] * (1 - alpha) + mask_color[lesion] * alpha
+        base[lesion].astype(float) * (1 - alpha) + 
+        mask_color[lesion].astype(float) * alpha
     ).astype(np.uint8)
 
     return overlay
 
 
 def make_panel(img, gt, prob, pred, metrics, name):
-    base = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    # Resize raw image to match the standard size (256x256)
+    base = cv2.resize(img, IMAGE_SIZE)
+    base = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+    
     gt_col = colorize_mask(gt)
     pred_col = colorize_mask(pred)
+    
+    # Ensure prob visualization is colored and the same size
     prob_col = cv2.applyColorMap(prob, cv2.COLORMAP_JET)
+    prob_col = cv2.resize(prob_col, IMAGE_SIZE)
+
+    # Overlays are already generated at mask size in make_overlay
+    gt_overlay = make_overlay(img, gt)
+    pred_overlay = make_overlay(img, pred)
 
     top = np.hstack([base, gt_col, prob_col])
-    bottom = np.hstack([pred_col, make_overlay(img, gt), make_overlay(img, pred)])
+    bottom = np.hstack([pred_col, gt_overlay, pred_overlay])
 
     return np.vstack([top, bottom])
 
@@ -154,11 +168,12 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_doubleunet()
+    # Loading weights
     model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
     model.to(device)
     model.eval()
 
-    # 🔥 MASS FILTER APPLIED HERE
+    # Filter for MASS images
     image_paths = sorted(glob(os.path.join(IMAGE_DIR, "*.png")))
     image_paths = [p for p in image_paths if "mass" in os.path.basename(p).lower()]
 
@@ -182,11 +197,13 @@ def main():
 
             gt = load_gt_mask(mask_path, IMAGE_SIZE)
 
+            # DoubleU-Net returns two outputs, we use the final one (p2)
             _, p2 = model(tensor)
             prob, pred = tensor_to_prediction(p2)
 
             jac, f1, rec, prec = calculate_multiclass_metrics(gt, pred)
 
+            # Sum probabilities of lesion classes (1 and 2) for heat map
             prob_vis = (np.sum(prob[1:], axis=0) * 255).astype(np.uint8)
 
             cv2.imwrite(os.path.join(MASK_OUTPUT_DIR, name), pred)
