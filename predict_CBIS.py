@@ -9,7 +9,7 @@ import torch
 from CBIS_model import build_doubleunet
 
 
-CHECKPOINT_PATH = "files/CBIS_checkpoint.pth"
+CHECKPOINT_PATH = "files/CBIS_checkpoint.pth.zip"
 
 IMAGE_DIR = "dataset_seg_CBIS/test/images"
 MASK_DIR = "dataset_seg_CBIS/test/masks"
