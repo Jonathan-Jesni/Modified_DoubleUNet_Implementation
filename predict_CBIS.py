@@ -9,7 +9,7 @@ import torch
 from CBIS_model import build_doubleunet
 
 
-CHECKPOINT_PATH = "files/CBIS_checkpoint.pth.zip"
+CHECKPOINT_PATH = "files/CBIS_checkpoint.pth"
 
 IMAGE_DIR = "dataset_seg_CBIS/test/images"
 MASK_DIR = "dataset_seg_CBIS/test/masks"
@@ -98,7 +98,18 @@ def load_gt_mask(mask_path, size):
 def tensor_to_prediction(pred_tensor):
     prob = torch.softmax(pred_tensor, dim=1).cpu().numpy()[0]
     pred_classes = np.argmax(prob, axis=0).astype(np.uint8)
-    return prob, pred_classes
+    
+    # --- IMMEDIATE FIX: OpenCV Post-Processing ---
+    # Create a simple 5x5 kernel
+    kernel = np.ones((5,5), np.uint8)
+    
+    # 1. Morphological Opening (Removes stray background noise pixels)
+    cleaned_classes = cv2.morphologyEx(pred_classes, cv2.MORPH_OPEN, kernel)
+    
+    # 2. Morphological Closing (Fills tiny holes inside the detected mass)
+    cleaned_classes = cv2.morphologyEx(cleaned_classes, cv2.MORPH_CLOSE, kernel)
+    
+    return prob, cleaned_classes
 
 
 def colorize_mask(mask):
