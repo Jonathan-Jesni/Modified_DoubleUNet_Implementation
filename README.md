@@ -1,6 +1,6 @@
 # Modified Double U-Net for Multi-Class Medical Image Segmentation
 
-This repository contains a **PyTorch implementation** of the **Modified Double U-Net** architecture, specifically optimized for multi-class segmentation of medical images. This project builds upon the Double U-Net framework by introducing ensemble-based feature extraction and multi-class spatial attention gates.
+This repository contains a **PyTorch implementation** of the **Modified Double U-Net** architecture, specifically optimized for multi-class segmentation of medical images. This project builds upon the Double U-Net framework by introducing ensemble-based feature extraction and multi-class spatial attention gates, tailored specifically for datasets like **BUSI** and **CBIS-DDSM**.
 
 ## 🚀 Key Features
 * **Architecture**: Dual-stacked U-Net design with an advanced ensemble encoder.
@@ -28,16 +28,24 @@ The Modified Double U-Net consists of two primary subnetworks:
 
 ## 📁 Project Structure
 
+Our pipeline is functionally split to handle the specific preprocessing and architectural nuances of the BUSI and CBIS datasets independently.
+
 ~~~text
-├── dataset_seg/         # Training (517), Validation (65), and Test (65) data
-├── files/               # Saved model checkpoints (.pth) and train_log.txt
-├── train.py             # Main training loop with AMP and Auto-Resume capability
-├── test.py              # Quantitative evaluation and GPU-synced FPS benchmarking
-├── predict.py           # Inference script with RGB multi-class mask overlays
-├── model.py             # Modified DoubleU-Net architecture implementation
-├── metrics.py           # CombinedLoss and MultiClassDiceLoss functions
-├── utils.py             # Class-wise metric calculators (with Empty-Class safety checks)
-└── requirements.txt     # Python dependencies
+├── dataset_busi/            # Formatted BUSI dataset (train/val splits, images, masks)
+├── dataset_seg/             # Formatted CBIS-DDSM dataset (train, valid, test)
+├── files/                   # Saved model checkpoints (.pth) and train logs
+├── prepare_busi_dataset.py  # Preprocessing logic and mask merging for BUSI
+├── prepare_cbis_dataset.py  # Preprocessing and label extraction logic for CBIS
+├── train_BUSI.py            # Main training loop for BUSI (AMP & Auto-Resume)
+├── train_CBIS.py            # Main training loop for CBIS (AMP & Auto-Resume)
+├── test_BUSI.py             # Quantitative evaluation and benchmarking for BUSI
+├── test_CBIS.py             # Quantitative evaluation and benchmarking for CBIS
+├── predict_BUSI.py          # Inference & RGB overlay generation for BUSI
+├── predict_CBIS.py          # Inference & RGB overlay generation for CBIS
+├── BUSI_model.py            # Modified DoubleU-Net architecture mapped for BUSI
+├── CBIS_model.py            # Modified DoubleU-Net architecture mapped for CBIS
+├── metrics.py               # CombinedLoss and MultiClassDiceLoss functions
+└── utils.py                 # Class-wise metric calculators & tensor safety checks
 ~~~
 
 ---
@@ -49,27 +57,34 @@ The Modified Double U-Net consists of two primary subnetworks:
 * **Recommended**: 12GB+ VRAM for larger batch sizes and optimal worker counts.
 
 ### Environment
-Ensure you have Python 3.8+ installed. Install the required dependencies:
+Ensure you have Python 3.8+ installed and your virtual environment activated. 
 
 ~~~bash
+# If using requirements.txt
 pip install -r requirements.txt
 ~~~
+
+*(Note: Ensure you have a compatible PyTorch build for your specific CUDA architecture).*
 
 ---
 
 ## 🏋️ Training
 
-The training script includes an **Auto-Resume Capability**—if stopped, it will automatically detect `files/checkpoint.pth` and seamlessly continue training from the last saved epoch without losing progress.
+Both training scripts include an **Auto-Resume Capability**—if stopped, they will automatically detect the respective checkpoint in the `files/` folder and seamlessly continue training from the last saved epoch without losing progress.
 
-To start or resume training:
-
+**To train on the BUSI Dataset:**
 ~~~bash
-python train.py
+python train_BUSI.py
+~~~
+
+**To train on the CBIS Dataset:**
+~~~bash
+python train_CBIS.py
 ~~~
 
 **Current Training Configuration:**
 * **Image Size**: 256x256
-* **Batch Size**: 8
+* **Batch Size**: 8 (Adjustable based on VRAM)
 * **Optimizer**: Adam (Learning Rate: 1e-4)
 * **Scheduler**: ReduceLROnPlateau 
 * **Early Stopping Patience**: 50 epochs
@@ -80,10 +95,14 @@ python train.py
 ## 📊 Evaluation & Inference
 
 ### Quantitative Testing
-Evaluate the model on the unseen test set to generate research-grade, class-wise metrics (F1-Score, Jaccard Index/IoU, Recall, Precision). The evaluation includes tensor safety nets to prevent false metric inflation on empty classes.
+Evaluate the model on the unseen test sets to generate research-grade, class-wise metrics (F1-Score, Jaccard Index/IoU, Recall, Precision). The evaluation includes tensor safety nets to prevent false metric inflation on empty classes.
 
 ~~~bash
-python test.py
+# For BUSI metrics
+python test_BUSI.py
+
+# For CBIS metrics
+python test_CBIS.py
 ~~~
 
 ### Visual Prediction
@@ -92,7 +111,11 @@ Generate segmentation masks with discrete colored overlays to visually verify ne
 * **Red Overlay**: Malignant Tissue
 
 ~~~bash
-python predict.py
+# Generate visual overlays for BUSI
+python predict_BUSI.py
+
+# Generate visual overlays for CBIS
+python predict_CBIS.py
 ~~~
 
 ---
