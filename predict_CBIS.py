@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from CBIS_model import build_doubleunet
+from utils import calculate_metrics
 
 
 CHECKPOINT_PATH = "files/CBIS_checkpoint.pth.zip"
@@ -32,41 +33,6 @@ def ensure_dirs():
     os.makedirs(PROB_OUTPUT_DIR, exist_ok=True)
     os.makedirs(OVERLAY_OUTPUT_DIR, exist_ok=True)
     os.makedirs(PANEL_OUTPUT_DIR, exist_ok=True)
-
-
-def calculate_multiclass_metrics(y_true, y_pred, num_classes=3):
-    jaccards, dices, recalls, precisions = [], [], [], []
-
-    for cls in range(1, num_classes):
-        true_cls = y_true == cls
-        pred_cls = y_pred == cls
-
-        tp = np.logical_and(true_cls, pred_cls).sum()
-        fp = np.logical_and(~true_cls, pred_cls).sum()
-        fn = np.logical_and(true_cls, ~pred_cls).sum()
-
-        if true_cls.sum() == 0 and pred_cls.sum() == 0:
-            continue
-
-        jaccard = tp / (tp + fp + fn + 1e-7)
-        dice = (2 * tp) / (2 * tp + fp + fn + 1e-7)
-        recall = tp / (tp + fn + 1e-7)
-        precision = tp / (tp + fp + 1e-7)
-
-        jaccards.append(jaccard)
-        dices.append(dice)
-        recalls.append(recall)
-        precisions.append(precision)
-
-    if len(jaccards) == 0:
-        return 0.0, 0.0, 0.0, 0.0
-
-    return (
-        float(np.mean(jaccards)),
-        float(np.mean(dices)),
-        float(np.mean(recalls)),
-        float(np.mean(precisions)),
-    )
 
 
 def load_image(image_path, size):
@@ -99,17 +65,7 @@ def tensor_to_prediction(pred_tensor):
     prob = torch.softmax(pred_tensor, dim=1).cpu().numpy()[0]
     pred_classes = np.argmax(prob, axis=0).astype(np.uint8)
     
-    # --- IMMEDIATE FIX: OpenCV Post-Processing ---
-    # Create a simple 5x5 kernel
-    kernel = np.ones((5,5), np.uint8)
-    
-    # 1. Morphological Opening (Removes stray background noise pixels)
-    cleaned_classes = cv2.morphologyEx(pred_classes, cv2.MORPH_OPEN, kernel)
-    
-    # 2. Morphological Closing (Fills tiny holes inside the detected mass)
-    cleaned_classes = cv2.morphologyEx(cleaned_classes, cv2.MORPH_CLOSE, kernel)
-    
-    return prob, cleaned_classes
+    return prob, pred_classes
 
 
 def colorize_mask(mask):
@@ -172,26 +128,34 @@ def main():
     ensure_dirs()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Using device: {device}")
 
+    print("[INFO] Loading model...")
     model = build_doubleunet()
     # Loading weights
     model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
     model.to(device)
     model.eval()
 
-    # Filter for MASS images
     image_paths = sorted(glob(os.path.join(IMAGE_DIR, "*.png")))
     image_paths = [p for p in image_paths if "mass" in os.path.basename(p).lower()]
 
     if not image_paths:
         raise RuntimeError("No MASS images found")
 
-    print(f"[INFO] MASS images: {len(image_paths)}")
+    print(f"[INFO] Found {len(image_paths)} test images")
 
     results = []
 
+    summary_metrics = {
+        "jaccard": [],
+        "f1": [],
+        "recall": [],
+        "precision": [],
+    }
+
     with torch.no_grad():
-        for i, path in enumerate(image_paths):
+        for i, path in enumerate(image_paths, start=1):
             name = os.path.basename(path)
 
             mask_path = find_matching_mask(name)
@@ -207,7 +171,9 @@ def main():
             _, p2 = model(tensor)
             prob, pred = tensor_to_prediction(p2)
 
-            jac, f1, rec, prec = calculate_multiclass_metrics(gt, pred)
+            gt_tensor = torch.from_numpy(gt).to(device)
+            pred_tensor = torch.from_numpy(pred).to(device)
+            jac, f1, rec, prec = calculate_metrics(gt_tensor, pred_tensor)
 
             # Sum probabilities of lesion classes (1 and 2) for heat map
             prob_vis = (np.sum(prob[1:], axis=0) * 255).astype(np.uint8)
@@ -226,10 +192,28 @@ def main():
                 "recall": rec,
                 "precision": prec
             })
+            
+            summary_metrics["jaccard"].append(jac)
+            summary_metrics["f1"].append(f1)
+            summary_metrics["recall"].append(rec)
+            summary_metrics["precision"].append(prec)
 
-            print(f"[{i+1}/{len(image_paths)}] {name} | Dice: {f1:.4f}")
+            print(f"[{i:03d}/{len(image_paths):03d}] {name} | Jaccard: {jac:.4f} | F1: {f1:.4f}")
 
     write_csv(results)
+
+    if len(results) > 0:
+        print("\n" + "=" * 60)
+        print("[SUMMARY - MULTI-CLASS]")
+        print(f"Images evaluated : {len(results)}")
+        print(f"Mean Jaccard     : {np.mean(summary_metrics['jaccard']):.4f}")
+        print(f"Mean F1 / Dice   : {np.mean(summary_metrics['f1']):.4f}")
+        print(f"Mean Recall      : {np.mean(summary_metrics['recall']):.4f}")
+        print(f"Mean Precision   : {np.mean(summary_metrics['precision']):.4f}")
+        print(f"CSV saved at     : {CSV_PATH}")
+        print("=" * 60)
+    else:
+        print("[INFO] No images were evaluated.")
 
 
 if __name__ == "__main__":
