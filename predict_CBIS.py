@@ -10,7 +10,7 @@ from CBIS_model import build_doubleunet
 from utils import calculate_metrics
 
 
-CHECKPOINT_PATH = "files/CBIS_checkpoint.pth.zip"
+CHECKPOINT_PATH = "files/CBIS_checkpoint.pth"
 
 IMAGE_DIR = "dataset_seg_CBIS/test/images"
 MASK_DIR = "dataset_seg_CBIS/test/masks"

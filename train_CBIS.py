@@ -3,11 +3,14 @@ import time
 import datetime
 from glob import glob
 
+# NOTE: import torch BEFORE albumentations. On Windows, importing albumentations
+# first loads a runtime DLL that breaks torch's c10.dll init (OSError WinError 1114).
+import torch
+from torch.utils.data import Dataset, DataLoader
+
 import albumentations as A
 import cv2
 import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader
 
 from utils import (
     seeding,
@@ -16,9 +19,10 @@ from utils import (
     shuffling,
     epoch_time,
     calculate_metrics,
+    calculate_foreground_metrics,
 )
 from CBIS_model import build_doubleunet
-from metrics import CombinedLoss
+from metrics import CombinedLoss, CBIS_CLASS_WEIGHTS
 
 
 DEBUG_VIS_DIR = "files/debug_train_visuals"
@@ -153,10 +157,8 @@ def train(model, loader, optimizer, loss_fn, device):
     model.train()
 
     epoch_loss = 0.0
-    epoch_jac = 0.0
-    epoch_f1 = 0.0
-    epoch_recall = 0.0
-    epoch_precision = 0.0
+    metrics_bg = [0.0, 0.0, 0.0, 0.0]   # background-inclusive (logging only)
+    metrics_fg = [0.0, 0.0, 0.0, 0.0]   # foreground-only (drives checkpoint/early-stop)
 
     use_cuda_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_cuda_amp)
@@ -178,21 +180,16 @@ def train(model, loader, optimizer, loss_fn, device):
         epoch_loss += loss.item()
 
         p2_classes = torch.argmax(p2, dim=1)
-        score = calculate_metrics(y, p2_classes)
+        score_bg = calculate_metrics(y, p2_classes)
+        score_fg = calculate_foreground_metrics(y, p2_classes)
+        metrics_bg = [a + b for a, b in zip(metrics_bg, score_bg)]
+        metrics_fg = [a + b for a, b in zip(metrics_fg, score_fg)]
 
-        epoch_jac += score[0]
-        epoch_f1 += score[1]
-        epoch_recall += score[2]
-        epoch_precision += score[3]
-
+    n = len(loader)
     return (
-        epoch_loss / len(loader),
-        [
-            epoch_jac / len(loader),
-            epoch_f1 / len(loader),
-            epoch_recall / len(loader),
-            epoch_precision / len(loader),
-        ],
+        epoch_loss / n,
+        [m / n for m in metrics_bg],
+        [m / n for m in metrics_fg],
     )
 
 
@@ -200,10 +197,8 @@ def evaluate(model, loader, loss_fn, device):
     model.eval()
 
     epoch_loss = 0.0
-    epoch_jac = 0.0
-    epoch_f1 = 0.0
-    epoch_recall = 0.0
-    epoch_precision = 0.0
+    metrics_bg = [0.0, 0.0, 0.0, 0.0]   # background-inclusive (logging only)
+    metrics_fg = [0.0, 0.0, 0.0, 0.0]   # foreground-only (drives checkpoint/early-stop)
 
     use_cuda_amp = device.type == "cuda"
 
@@ -219,21 +214,16 @@ def evaluate(model, loader, loss_fn, device):
             epoch_loss += loss.item()
 
             p2_classes = torch.argmax(p2, dim=1)
-            score = calculate_metrics(y, p2_classes)
+            score_bg = calculate_metrics(y, p2_classes)
+            score_fg = calculate_foreground_metrics(y, p2_classes)
+            metrics_bg = [a + b for a, b in zip(metrics_bg, score_bg)]
+            metrics_fg = [a + b for a, b in zip(metrics_fg, score_fg)]
 
-            epoch_jac += score[0]
-            epoch_f1 += score[1]
-            epoch_recall += score[2]
-            epoch_precision += score[3]
-
+    n = len(loader)
     return (
-        epoch_loss / len(loader),
-        [
-            epoch_jac / len(loader),
-            epoch_f1 / len(loader),
-            epoch_recall / len(loader),
-            epoch_precision / len(loader),
-        ],
+        epoch_loss / n,
+        [m / n for m in metrics_bg],
+        [m / n for m in metrics_fg],
     )
 
 
@@ -255,7 +245,7 @@ if __name__ == "__main__":
     size = (image_size, image_size)
 
     batch_size = 8
-    num_epochs = 300
+    num_epochs = int(os.environ.get("MAX_EPOCHS", "300"))
     lr = 1e-4
     early_stopping_patience = 50
 
@@ -274,15 +264,28 @@ if __name__ == "__main__":
     data_str = f"Dataset Size:\nTrain: {len(train_x)} - Valid: {len(valid_x)} - Test: {len(test_x)}\n"
     print_and_save(train_log_path, data_str)
 
-    transform = A.Compose([
-        A.Rotate(limit=15, p=0.3, border_mode=cv2.BORDER_REFLECT_101),
-        A.HorizontalFlip(p=0.5),
-        A.CoarseDropout(
+    # CoarseDropout's kwargs changed in albumentations >=1.4 (range tuples) vs the
+    # older scalar API (<1.4). Build it compatibly so the same script runs on both
+    # the local venv (1.3.x) and the cloud env (2.x).
+    try:
+        coarse_dropout = A.CoarseDropout(
             num_holes_range=(1, 6),
             hole_height_range=(1, 20),
             hole_width_range=(1, 20),
-            p=0.15
-        ),
+            p=0.15,
+        )
+    except TypeError:
+        coarse_dropout = A.CoarseDropout(
+            min_holes=1, max_holes=6,
+            min_height=1, max_height=20,
+            min_width=1, max_width=20,
+            p=0.15,
+        )
+
+    transform = A.Compose([
+        A.Rotate(limit=15, p=0.3, border_mode=cv2.BORDER_REFLECT_101),
+        A.HorizontalFlip(p=0.5),
+        coarse_dropout,
     ])
 
     train_dataset = DATASET(train_x, train_y, size, transform=transform)
@@ -330,10 +333,12 @@ if __name__ == "__main__":
         patience=5
     )
 
-    loss_fn = CombinedLoss(num_classes=NUM_CLASSES)
-    loss_name = "CrossEntropy + Multi-Class Dice Loss"
+    loss_fn = CombinedLoss(num_classes=NUM_CLASSES, class_weights=CBIS_CLASS_WEIGHTS)
+    loss_fn = loss_fn.to(device)
+    loss_name = "Weighted CrossEntropy + Foreground Multi-Class Dice Loss"
 
     print_and_save(train_log_path, f"Optimizer: Adam\nLoss: {loss_name}\n")
+    print_and_save(train_log_path, f"CE class weights [bg, benign, malignant]: {CBIS_CLASS_WEIGHTS}\n")
 
     best_valid_f1 = 0.0
     early_stopping_count = 0
@@ -341,19 +346,21 @@ if __name__ == "__main__":
     for epoch in range(num_epochs):
         start_time = time.time()
 
-        train_loss, train_metrics = train(model, train_loader, optimizer, loss_fn, device)
-        valid_loss, valid_metrics = evaluate(model, valid_loader, loss_fn, device)
+        train_loss, train_bg, train_fg = train(model, train_loader, optimizer, loss_fn, device)
+        valid_loss, valid_bg, valid_fg = evaluate(model, valid_loader, loss_fn, device)
 
         scheduler.step(valid_loss)
 
-        if valid_metrics[1] > best_valid_f1:
+        # Checkpoint / early-stopping decision is driven by FOREGROUND-only F1
+        # (lesions), not the background-inclusive number.
+        if valid_fg[1] > best_valid_f1:
             data_str = (
-                f"Valid F1 improved from {best_valid_f1:2.4f} "
-                f"to {valid_metrics[1]:2.4f}. Saving checkpoint: {checkpoint_path}"
+                f"Valid foreground F1 improved from {best_valid_f1:2.4f} "
+                f"to {valid_fg[1]:2.4f}. Saving checkpoint: {checkpoint_path}"
             )
             print_and_save(train_log_path, data_str)
 
-            best_valid_f1 = valid_metrics[1]
+            best_valid_f1 = valid_fg[1]
             torch.save(model.state_dict(), checkpoint_path)
             early_stopping_count = 0
         else:
@@ -363,18 +370,18 @@ if __name__ == "__main__":
 
         data_str = f"Epoch: {epoch + 1:02} | Epoch Time: {epoch_mins}m {epoch_secs}s\n"
         data_str += (
-            f"\tTrain Loss: {train_loss:.4f} - "
-            f"Jaccard: {train_metrics[0]:.4f} - "
-            f"F1: {train_metrics[1]:.4f} - "
-            f"Recall: {train_metrics[2]:.4f} - "
-            f"Precision: {train_metrics[3]:.4f}\n"
+            f"\tTrain Loss: {train_loss:.4f}\n"
+            f"\t  [fg]  Jaccard: {train_fg[0]:.4f} - F1: {train_fg[1]:.4f} - "
+            f"Recall: {train_fg[2]:.4f} - Precision: {train_fg[3]:.4f}\n"
+            f"\t  [all] Jaccard: {train_bg[0]:.4f} - F1: {train_bg[1]:.4f} - "
+            f"Recall: {train_bg[2]:.4f} - Precision: {train_bg[3]:.4f}\n"
         )
         data_str += (
-            f"\t Val. Loss: {valid_loss:.4f} - "
-            f"Jaccard: {valid_metrics[0]:.4f} - "
-            f"F1: {valid_metrics[1]:.4f} - "
-            f"Recall: {valid_metrics[2]:.4f} - "
-            f"Precision: {valid_metrics[3]:.4f}\n"
+            f"\t Val. Loss: {valid_loss:.4f}\n"
+            f"\t  [fg]  Jaccard: {valid_fg[0]:.4f} - F1: {valid_fg[1]:.4f} - "
+            f"Recall: {valid_fg[2]:.4f} - Precision: {valid_fg[3]:.4f}\n"
+            f"\t  [all] Jaccard: {valid_bg[0]:.4f} - F1: {valid_bg[1]:.4f} - "
+            f"Recall: {valid_bg[2]:.4f} - Precision: {valid_bg[3]:.4f}\n"
         )
 
         print_and_save(train_log_path, data_str)
@@ -382,6 +389,6 @@ if __name__ == "__main__":
         if early_stopping_count >= early_stopping_patience:
             print_and_save(
                 train_log_path,
-                f"Early stopping: validation F1 did not improve for {early_stopping_patience} consecutive epochs.\n"
+                f"Early stopping: validation foreground F1 did not improve for {early_stopping_patience} consecutive epochs.\n"
             )
             break

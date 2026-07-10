@@ -8,7 +8,7 @@ from tqdm import tqdm
 import torch
 
 from BUSI_model import build_doubleunet
-from utils import create_dir, seeding, calculate_metrics
+from utils import create_dir, seeding, calculate_foreground_metrics
 from train_BUSI import load_data
 
 
@@ -100,7 +100,12 @@ def evaluate(model, save_path, test_x, test_y, size, device):
         name = os.path.basename(x)
 
         # ---------------- Image ----------------
-        image = cv2.imread(x, cv2.IMREAD_COLOR)
+        # Read grayscale then expand to 3 identical channels, matching
+        # train_BUSI / predict_BUSI exactly (avoids any BGR-vs-RGB divergence).
+        image_gray = cv2.imread(x, cv2.IMREAD_GRAYSCALE)
+        if image_gray is None:
+            raise ValueError(f"Failed to read image: {x}")
+        image = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2RGB)
         image = cv2.resize(image, size)
 
         save_img = image.copy()
@@ -148,8 +153,9 @@ def evaluate(model, save_path, test_x, test_y, size, device):
 
             mask_flat = mask_tensor.squeeze(0)
 
-            score_1 = calculate_metrics(mask_flat, y_pred1_classes)
-            score_2 = calculate_metrics(mask_flat, y_pred2_classes)
+            # Foreground-only (background excluded) headline, matching test_CBIS.
+            score_1 = calculate_foreground_metrics(mask_flat, y_pred1_classes)
+            score_2 = calculate_foreground_metrics(mask_flat, y_pred2_classes)
 
             metrics_score_1 = list(map(add, metrics_score_1, score_1))
             metrics_score_2 = list(map(add, metrics_score_2, score_2))
@@ -239,7 +245,7 @@ if __name__ == "__main__":
     # Print parameter count before loading checkpoint
     print_model_parameters(model)
 
-    checkpoint_path = "files/BUSI_checkpoint.pth.zip"
+    checkpoint_path = "files/BUSI_checkpoint.pth"
 
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")

@@ -3,11 +3,14 @@ import time
 import datetime
 from glob import glob
 
+# NOTE: import torch BEFORE albumentations. On Windows, importing albumentations
+# first loads a runtime DLL that breaks torch's c10.dll init (OSError WinError 1114).
+import torch
+from torch.utils.data import Dataset, DataLoader
+
 import albumentations as A
 import cv2
 import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader
 
 from utils import (
     seeding,
@@ -16,9 +19,10 @@ from utils import (
     shuffling,
     epoch_time,
     calculate_metrics,
+    calculate_foreground_metrics,
 )
 from BUSI_model import build_doubleunet
-from metrics import DiceBCELoss, MultiClassDiceLoss, CombinedLoss
+from metrics import DiceBCELoss, MultiClassDiceLoss, CombinedLoss, BUSI_CLASS_WEIGHTS
 
 
 def load_data(path):
@@ -124,26 +128,24 @@ def train(model, loader, optimizer, loss_fn, device):
     model.train()
 
     epoch_loss = 0.0
-    epoch_jac = 0.0
-    epoch_f1 = 0.0
-    epoch_recall = 0.0
-    epoch_precision = 0.0
+    metrics_bg = [0.0, 0.0, 0.0, 0.0]   # background-inclusive (logging only)
+    metrics_fg = [0.0, 0.0, 0.0, 0.0]   # foreground-only (drives checkpoint/early-stop)
 
     # SPEED PATCH 1: Initialize AMP Scaler
     scaler = torch.amp.GradScaler('cuda')
-    
+
     for x, y in loader:
         x = x.to(device, dtype=torch.float32)
         y = y.to(device, dtype=torch.long)
-        
+
         # SPEED PATCH 2: set_to_none=True clears gradients faster
         optimizer.zero_grad(set_to_none=True)
-        
+
         # SPEED PATCH 3: autocast for 16-bit math
         with torch.amp.autocast('cuda'):
             p1, p2 = model(x)
             loss = loss_fn(p1, y) + loss_fn(p2, y)
-            
+
         # SPEED PATCH 4: Scaled backward pass
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -152,29 +154,21 @@ def train(model, loader, optimizer, loss_fn, device):
         epoch_loss += loss.item()
 
         p2_classes = torch.argmax(p2, dim=1)
-        score = calculate_metrics(y, p2_classes)
-        epoch_jac += score[0]
-        epoch_f1 += score[1]
-        epoch_recall += score[2]
-        epoch_precision += score[3]
+        score_bg = calculate_metrics(y, p2_classes)
+        score_fg = calculate_foreground_metrics(y, p2_classes)
+        metrics_bg = [a + b for a, b in zip(metrics_bg, score_bg)]
+        metrics_fg = [a + b for a, b in zip(metrics_fg, score_fg)]
 
-    epoch_loss = epoch_loss / len(loader)
-    epoch_jac = epoch_jac / len(loader)
-    epoch_f1 = epoch_f1 / len(loader)
-    epoch_recall = epoch_recall / len(loader)
-    epoch_precision = epoch_precision / len(loader)
-
-    return epoch_loss, [epoch_jac, epoch_f1, epoch_recall, epoch_precision]
+    n = len(loader)
+    return epoch_loss / n, [m / n for m in metrics_bg], [m / n for m in metrics_fg]
 
 
 def evaluate(model, loader, loss_fn, device):
     model.eval()
 
     epoch_loss = 0.0
-    epoch_jac = 0.0
-    epoch_f1 = 0.0
-    epoch_recall = 0.0
-    epoch_precision = 0.0
+    metrics_bg = [0.0, 0.0, 0.0, 0.0]   # background-inclusive (logging only)
+    metrics_fg = [0.0, 0.0, 0.0, 0.0]   # foreground-only (drives checkpoint/early-stop)
 
     with torch.no_grad():
         for x, y in loader:
@@ -184,23 +178,17 @@ def evaluate(model, loader, loss_fn, device):
                 y = y.to(device, dtype=torch.long)
                 p1, p2 = model(x)
                 loss = loss_fn(p1, y) + loss_fn(p2, y)
-                
+
             epoch_loss += loss.item()
 
             p2_classes = torch.argmax(p2, dim=1)
-            score = calculate_metrics(y, p2_classes)
-            epoch_jac += score[0]
-            epoch_f1 += score[1]
-            epoch_recall += score[2]
-            epoch_precision += score[3]
+            score_bg = calculate_metrics(y, p2_classes)
+            score_fg = calculate_foreground_metrics(y, p2_classes)
+            metrics_bg = [a + b for a, b in zip(metrics_bg, score_bg)]
+            metrics_fg = [a + b for a, b in zip(metrics_fg, score_fg)]
 
-    epoch_loss = epoch_loss / len(loader)
-    epoch_jac = epoch_jac / len(loader)
-    epoch_f1 = epoch_f1 / len(loader)
-    epoch_recall = epoch_recall / len(loader)
-    epoch_precision = epoch_precision / len(loader)
-
-    return epoch_loss, [epoch_jac, epoch_f1, epoch_recall, epoch_precision]
+    n = len(loader)
+    return epoch_loss / n, [m / n for m in metrics_bg], [m / n for m in metrics_fg]
 
 
 if __name__ == "__main__":
@@ -225,7 +213,7 @@ if __name__ == "__main__":
     image_size = 256
     size = (image_size, image_size)
     batch_size = 8 # SPEED PATCH 6: Increased batch size
-    num_epochs = 300
+    num_epochs = int(os.environ.get("MAX_EPOCHS", "300"))
     lr = 1e-4
     early_stopping_patience = 50
     checkpoint_path = "files/BUSI_checkpoint.pth"
@@ -247,16 +235,29 @@ if __name__ == "__main__":
     print_and_save(train_log_path, data_str)
 
     # Data augmentation
+    # CoarseDropout's kwargs changed in albumentations >=1.4 (range tuples) vs the
+    # older scalar API (<1.4). Build it compatibly so the same script runs on both
+    # the local venv (1.3.x) and the cloud env (2.x).
+    try:
+        coarse_dropout = A.CoarseDropout(
+            num_holes_range=(1, 8),
+            hole_height_range=(1, 24),
+            hole_width_range=(1, 24),
+            p=0.2,
+        )
+    except TypeError:
+        coarse_dropout = A.CoarseDropout(
+            min_holes=1, max_holes=8,
+            min_height=1, max_height=24,
+            min_width=1, max_width=24,
+            p=0.2,
+        )
+
     transform = A.Compose([
         A.Rotate(limit=20, p=0.3, border_mode=cv2.BORDER_REFLECT_101),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.2),
-        A.CoarseDropout(
-            num_holes_range=(1, 8),
-            hole_height_range=(1, 24),
-            hole_width_range=(1, 24),
-            p=0.2
-        ),
+        coarse_dropout,
     ])
 
     # Dataset and loader
@@ -303,10 +304,12 @@ if __name__ == "__main__":
         optimizer, mode="min", patience=5
     )
     
-    loss_fn = CombinedLoss(num_classes=3)
-    loss_name = "CrossEntropy + Multi-Class Dice Loss"
+    loss_fn = CombinedLoss(num_classes=3, class_weights=BUSI_CLASS_WEIGHTS)
+    loss_fn = loss_fn.to(device)
+    loss_name = "Weighted CrossEntropy + Foreground Multi-Class Dice Loss"
 
     data_str = f"Optimizer: Adam\nLoss: {loss_name}\n"
+    data_str += f"CE class weights [bg, benign, malignant]: {BUSI_CLASS_WEIGHTS}\n"
     print_and_save(train_log_path, data_str)
 
     # Training
@@ -316,18 +319,20 @@ if __name__ == "__main__":
     for epoch in range(num_epochs):
         start_time = time.time()
 
-        train_loss, train_metrics = train(model, train_loader, optimizer, loss_fn, device)
-        valid_loss, valid_metrics = evaluate(model, valid_loader, loss_fn, device)
+        train_loss, train_bg, train_fg = train(model, train_loader, optimizer, loss_fn, device)
+        valid_loss, valid_bg, valid_fg = evaluate(model, valid_loader, loss_fn, device)
         scheduler.step(valid_loss)
 
-        if valid_metrics[1] > best_valid_f1:
+        # Checkpoint / early-stopping decision is driven by FOREGROUND-only F1
+        # (lesions), not the background-inclusive number.
+        if valid_fg[1] > best_valid_f1:
             data_str = (
-                f"Valid F1 improved from {best_valid_f1:2.4f} to {valid_metrics[1]:2.4f}. "
+                f"Valid foreground F1 improved from {best_valid_f1:2.4f} to {valid_fg[1]:2.4f}. "
                 f"Saving checkpoint: {checkpoint_path}"
             )
             print_and_save(train_log_path, data_str)
 
-            best_valid_f1 = valid_metrics[1]
+            best_valid_f1 = valid_fg[1]
             torch.save(model.state_dict(), checkpoint_path)
             early_stopping_count = 0
         else:
@@ -338,24 +343,24 @@ if __name__ == "__main__":
 
         data_str = f"Epoch: {epoch + 1:02} | Epoch Time: {epoch_mins}m {epoch_secs}s\n"
         data_str += (
-            f"\tTrain Loss: {train_loss:.4f} - "
-            f"Jaccard: {train_metrics[0]:.4f} - "
-            f"F1: {train_metrics[1]:.4f} - "
-            f"Recall: {train_metrics[2]:.4f} - "
-            f"Precision: {train_metrics[3]:.4f}\n"
+            f"\tTrain Loss: {train_loss:.4f}\n"
+            f"\t  [fg]  Jaccard: {train_fg[0]:.4f} - F1: {train_fg[1]:.4f} - "
+            f"Recall: {train_fg[2]:.4f} - Precision: {train_fg[3]:.4f}\n"
+            f"\t  [all] Jaccard: {train_bg[0]:.4f} - F1: {train_bg[1]:.4f} - "
+            f"Recall: {train_bg[2]:.4f} - Precision: {train_bg[3]:.4f}\n"
         )
         data_str += (
-            f"\t Val. Loss: {valid_loss:.4f} - "
-            f"Jaccard: {valid_metrics[0]:.4f} - "
-            f"F1: {valid_metrics[1]:.4f} - "
-            f"Recall: {valid_metrics[2]:.4f} - "
-            f"Precision: {valid_metrics[3]:.4f}\n"
+            f"\t Val. Loss: {valid_loss:.4f}\n"
+            f"\t  [fg]  Jaccard: {valid_fg[0]:.4f} - F1: {valid_fg[1]:.4f} - "
+            f"Recall: {valid_fg[2]:.4f} - Precision: {valid_fg[3]:.4f}\n"
+            f"\t  [all] Jaccard: {valid_bg[0]:.4f} - F1: {valid_bg[1]:.4f} - "
+            f"Recall: {valid_bg[2]:.4f} - Precision: {valid_bg[3]:.4f}\n"
         )
         print_and_save(train_log_path, data_str)
 
         if early_stopping_count >= early_stopping_patience:
             data_str = (
-                f"Early stopping: validation F1 did not improve for "
+                f"Early stopping: validation foreground F1 did not improve for "
                 f"{early_stopping_patience} consecutive epochs.\n"
             )
             print_and_save(train_log_path, data_str)

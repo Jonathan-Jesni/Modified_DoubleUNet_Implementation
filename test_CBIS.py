@@ -11,14 +11,14 @@ import torch
 from tqdm import tqdm
 
 from CBIS_model import build_doubleunet
-from utils import create_dir, seeding
+from utils import create_dir, seeding, calculate_foreground_metrics
 
 
 NUM_CLASSES = 3
 SIZE = (256, 256)
 
 DATASET_PATH = "dataset_seg_CBIS"
-CHECKPOINT_PATH = "files/CBIS_checkpoint.pth.zip"
+CHECKPOINT_PATH = "files/CBIS_checkpoint.pth"
 SAVE_PATH = "results_CBIS"
 
 
@@ -96,47 +96,11 @@ def make_overlay(image_rgb, mask_classes, alpha=0.45):
     return overlay
 
 
-def calculate_multiclass_metrics(y_true, y_pred, num_classes=3):
-    y_true = y_true.detach().cpu().numpy().astype(np.uint8)
-    y_pred = y_pred.detach().cpu().numpy().astype(np.uint8)
-
-    jaccards = []
-    dices = []
-    recalls = []
-    precisions = []
-
-    for cls in range(1, num_classes):
-        true_cls = y_true == cls
-        pred_cls = y_pred == cls
-
-        tp = np.logical_and(true_cls, pred_cls).sum()
-        fp = np.logical_and(~true_cls, pred_cls).sum()
-        fn = np.logical_and(true_cls, ~pred_cls).sum()
-
-        if true_cls.sum() == 0 and pred_cls.sum() == 0:
-            continue
-
-        jaccard = tp / (tp + fp + fn + 1e-7)
-        dice = (2 * tp) / (2 * tp + fp + fn + 1e-7)
-        recall = tp / (tp + fn + 1e-7)
-        precision = tp / (tp + fp + 1e-7)
-
-        jaccards.append(jaccard)
-        dices.append(dice)
-        recalls.append(recall)
-        precisions.append(precision)
-
-    if len(jaccards) == 0:
-        return [0.0, 0.0, 0.0, 0.0]
-
-    return [
-        float(np.mean(jaccards)),
-        float(np.mean(dices)),
-        float(np.mean(recalls)),
-        float(np.mean(precisions)),
-    ]
-
-
+# NOTE: the headline "Output 1/2 Scores" below are FOREGROUND-ONLY (background
+# excluded) via utils.calculate_foreground_metrics — this is a deliberate choice so
+# the reported aggregate reflects lesion segmentation quality, not the trivially-easy
+# background, and so test_CBIS and test_BUSI report the same kind of number. The
+# per-class Dice/IoU block further down still lists background separately.
 def dice_per_class(pred, target, class_id, eps=1e-7):
     pred_c = pred == class_id
     target_c = target == class_id
@@ -232,8 +196,8 @@ def evaluate(model, save_path, test_x, test_y, size, device):
             y_pred1_classes = torch.argmax(y_pred1, dim=1)[0]
             y_pred2_classes = torch.argmax(y_pred2, dim=1)[0]
 
-            score_1 = calculate_multiclass_metrics(mask_tensor, y_pred1_classes, NUM_CLASSES)
-            score_2 = calculate_multiclass_metrics(mask_tensor, y_pred2_classes, NUM_CLASSES)
+            score_1 = calculate_foreground_metrics(mask_tensor, y_pred1_classes, NUM_CLASSES)
+            score_2 = calculate_foreground_metrics(mask_tensor, y_pred2_classes, NUM_CLASSES)
 
             metrics_score_1 = list(map(add, metrics_score_1, score_1))
             metrics_score_2 = list(map(add, metrics_score_2, score_2))

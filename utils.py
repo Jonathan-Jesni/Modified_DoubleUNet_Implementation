@@ -52,8 +52,10 @@ def otsu_mask(image, size):
     return th
 
 def calculate_metrics(y_true, y_pred, num_classes=3):
-    # ... (existing tensor conversion and flattening code) ...
-
+    # y_true / y_pred are integer class-index tensors of matching shape.
+    # Metrics are macro-averaged over the classes PRESENT in the ground truth
+    # (including background), so a class the image does not contain is skipped
+    # rather than scored a free 1.0.
     jaccard_scores, f1_scores, recall_scores, precision_scores = [], [], [], []
     epsilon = 1e-15
     
@@ -85,4 +87,52 @@ def calculate_metrics(y_true, y_pred, num_classes=3):
         torch.stack(f1_scores).mean().item() if f1_scores else 0.0,
         torch.stack(recall_scores).mean().item() if recall_scores else 0.0,
         torch.stack(precision_scores).mean().item() if precision_scores else 0.0
+    ]
+
+
+def calculate_foreground_metrics(y_true, y_pred, num_classes=3):
+    """Foreground-only (background/class-0 excluded) per-image metrics.
+
+    Returns [jaccard, dice/f1, recall, precision] macro-averaged over the lesion
+    classes (1..num_classes-1) that appear in either the ground truth or the
+    prediction for this image. This is the "honest" lesion number, unclouded by
+    the trivially-easy background class. Shared by test_BUSI and test_CBIS so the
+    two pipelines report the same aggregate. Accepts torch tensors or numpy arrays.
+    """
+    if isinstance(y_true, torch.Tensor):
+        y_true = y_true.detach().cpu().numpy()
+    if isinstance(y_pred, torch.Tensor):
+        y_pred = y_pred.detach().cpu().numpy()
+
+    y_true = y_true.astype(np.int64)
+    y_pred = y_pred.astype(np.int64)
+
+    jaccards, dices, recalls, precisions = [], [], [], []
+    eps = 1e-7
+
+    for c in range(1, num_classes):
+        true_c = (y_true == c)
+        pred_c = (y_pred == c)
+
+        # Skip a class only when it is absent from both GT and prediction.
+        if true_c.sum() == 0 and pred_c.sum() == 0:
+            continue
+
+        tp = np.logical_and(true_c, pred_c).sum()
+        fp = np.logical_and(~true_c, pred_c).sum()
+        fn = np.logical_and(true_c, ~pred_c).sum()
+
+        jaccards.append(tp / (tp + fp + fn + eps))
+        dices.append((2 * tp) / (2 * tp + fp + fn + eps))
+        recalls.append(tp / (tp + fn + eps))
+        precisions.append(tp / (tp + fp + eps))
+
+    if not jaccards:
+        return [0.0, 0.0, 0.0, 0.0]
+
+    return [
+        float(np.mean(jaccards)),
+        float(np.mean(dices)),
+        float(np.mean(recalls)),
+        float(np.mean(precisions)),
     ]

@@ -13,7 +13,7 @@ from utils import calculate_metrics
 # =========================================================
 # CONFIG
 # =========================================================
-CHECKPOINT_PATH = "files/BUSI_checkpoint.pth.zip"
+CHECKPOINT_PATH = "files/BUSI_checkpoint.pth"
 
 IMAGE_DIR = "dataset_seg_BUSI/test/images"
 MASK_DIR = "dataset_seg_BUSI/test/masks"
