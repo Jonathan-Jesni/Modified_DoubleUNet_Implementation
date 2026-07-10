@@ -155,6 +155,46 @@ def build_mask_from_json(ann_path: Path, image_shape):
     return mask
 
 
+def find_breast_bbox(img, margin_frac=0.02):
+    """Bounding box of the breast tissue in a full-resolution grayscale mammogram.
+
+    Otsu-thresholds the image to separate breast tissue from the black scanner
+    margin, then takes the LARGEST connected component (to ignore small scanner
+    artifacts / embedded text labels), expands its bbox by a small margin so the
+    crop doesn't clip the breast edge, and falls back to the full image if Otsu
+    finds no foreground at all.
+    """
+    h, w = img.shape[:2]
+
+    blur = cv2.GaussianBlur(img, (5, 5), 0)
+    _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(th, connectivity=8)
+
+    # Label 0 is the background component; skip it when picking the largest.
+    if num_labels <= 1:
+        return 0, 0, w, h
+
+    largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    x, y, bw, bh, area = stats[largest_label]
+
+    if area <= 0:
+        return 0, 0, w, h
+
+    margin_x = int(bw * margin_frac)
+    margin_y = int(bh * margin_frac)
+
+    x1 = max(0, x - margin_x)
+    y1 = max(0, y - margin_y)
+    x2 = min(w, x + bw + margin_x)
+    y2 = min(h, y + bh + margin_y)
+
+    if x2 <= x1 or y2 <= y1:
+        return 0, 0, w, h
+
+    return x1, y1, x2, y2
+
+
 def colorize_mask(mask):
     color = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
 
@@ -240,6 +280,14 @@ def save_split(split_name, samples):
         if mask is None:
             print(f"[WARN] Could not build mask for: {image_path}")
             continue
+
+        # Crop to the breast ROI (Otsu + largest connected component) so the
+        # downstream 256x256 resize in train/test/predict spends its resolution
+        # budget on breast tissue instead of the empty black scanner margin.
+        # img and mask share the exact same bbox so they stay pixel-aligned.
+        x1, y1, x2, y2 = find_breast_bbox(img)
+        img = img[y1:y2, x1:x2]
+        mask = mask[y1:y2, x1:x2]
 
         color_mask = colorize_mask(mask)
         overlay = make_overlay(img, mask)
