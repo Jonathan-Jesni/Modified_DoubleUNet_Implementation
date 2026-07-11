@@ -2,10 +2,11 @@ from pathlib import Path
 import json
 import base64
 import zlib
+import re
 
 import cv2
 import numpy as np
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 
 
 ROOT = Path(__file__).resolve().parent
@@ -22,6 +23,60 @@ RANDOM_STATE = 42
 
 def ensure_dir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
+
+
+def extract_patient_id(image_path: Path) -> str:
+    match = re.search(r"P_\d+", str(image_path))
+    if match is None:
+        raise ValueError(f"Could not extract a CBIS patient ID from: {image_path}")
+    return match.group(0)
+
+
+def split_by_patient(samples):
+    groups = [extract_patient_id(sample["image_path"]) for sample in samples]
+    all_indices = list(range(len(samples)))
+
+    outer_split = GroupShuffleSplit(
+        n_splits=1, test_size=0.20, random_state=RANDOM_STATE
+    )
+    train_indices, temp_indices = next(outer_split.split(all_indices, groups=groups))
+    train_samples = [samples[index] for index in train_indices]
+    temp_samples = [samples[index] for index in temp_indices]
+
+    temp_groups = [groups[index] for index in temp_indices]
+    inner_split = GroupShuffleSplit(
+        n_splits=1, test_size=0.50, random_state=RANDOM_STATE
+    )
+    val_indices, test_indices = next(
+        inner_split.split(list(range(len(temp_samples))), groups=temp_groups)
+    )
+    val_samples = [temp_samples[index] for index in val_indices]
+    test_samples = [temp_samples[index] for index in test_indices]
+
+    return train_samples, val_samples, test_samples
+
+
+def verify_patient_split(train_samples, val_samples, test_samples):
+    patient_sets = {
+        "train": {extract_patient_id(sample["image_path"]) for sample in train_samples},
+        "val": {extract_patient_id(sample["image_path"]) for sample in val_samples},
+        "test": {extract_patient_id(sample["image_path"]) for sample in test_samples},
+    }
+    overlaps = {
+        "train/val": patient_sets["train"] & patient_sets["val"],
+        "train/test": patient_sets["train"] & patient_sets["test"],
+        "val/test": patient_sets["val"] & patient_sets["test"],
+    }
+    print(
+        "Patient split verification: "
+        f"train/val={len(overlaps['train/val'])}, "
+        f"train/test={len(overlaps['train/test'])}, "
+        f"val/test={len(overlaps['val/test'])}"
+    )
+    if any(overlaps.values()):
+        raise RuntimeError(f"Patient leakage detected: {overlaps}")
+
+    return patient_sets
 
 
 def get_ann_path(split_dir: Path, image_path: Path):
@@ -310,22 +365,17 @@ def main():
 
     print(f"Total usable samples found: {len(all_samples)}")
 
-    # 2. First split: Take 80% for Training, leaving 20% for Temp (Val + Test)
-    train_samples, temp_samples = train_test_split(
-        all_samples,
-        test_size=0.20,
-        random_state=RANDOM_STATE,
-        shuffle=True
-    )
+    patient_examples = [
+        f"{sample['image_path'].name} -> {extract_patient_id(sample['image_path'])}"
+        for sample in all_samples[:5]
+    ]
+    print("Patient ID examples: " + "; ".join(patient_examples))
 
-    # 3. Second split: Cut that 20% Temp exactly in half (10% Val, 10% Test)
-    val_samples, test_samples = train_test_split(
-        temp_samples,
-        test_size=0.50,
-        random_state=RANDOM_STATE,
-        shuffle=True
-    )
+    # Keep the original 80/10/10 target while keeping each patient's images in one split.
+    train_samples, val_samples, test_samples = split_by_patient(all_samples)
+    patient_sets = verify_patient_split(train_samples, val_samples, test_samples)
 
+    print(f"Unique patients: {len(set().union(*patient_sets.values()))}")
     print(f"Train: {len(train_samples)}")
     print(f"Val  : {len(val_samples)}")
     print(f"Test : {len(test_samples)}")

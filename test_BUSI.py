@@ -11,6 +11,9 @@ from BUSI_model import build_doubleunet
 from utils import create_dir, seeding, calculate_foreground_metrics
 from train_BUSI import load_data
 
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)[:, None, None]
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)[:, None, None]
+
 
 COLOR_MAP = {
     0: (0, 0, 0),       # background = black
@@ -113,6 +116,7 @@ def evaluate(model, save_path, test_x, test_y, size, device):
         image_input = np.transpose(image, (2, 0, 1))
         image_input = np.expand_dims(image_input, axis=0)
         image_input = image_input / 255.0
+        image_input = (image_input - IMAGENET_MEAN) / IMAGENET_STD
         image_input = image_input.astype(np.float32)
 
         image_tensor = torch.from_numpy(image_input).to(device)

@@ -16,6 +16,8 @@ from utils import create_dir, seeding, calculate_foreground_metrics
 
 NUM_CLASSES = 3
 SIZE = (256, 256)
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)[:, None, None]
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)[:, None, None]
 
 DATASET_PATH = "dataset_seg_CBIS"
 CHECKPOINT_PATH = "files/CBIS_checkpoint.pth"
@@ -163,11 +165,9 @@ def evaluate(model, save_path, test_x, test_y, size, device):
 
         save_img = image_rgb.copy()
 
-        # FIXED: Just divide by 255.0 to match training normalizer
         image = image_rgb.astype(np.float32) / 255.0
-        # REMOVED: image = (image - 0.5) / 0.5 
-        
         image = np.transpose(image, (2, 0, 1))
+        image = (image - IMAGENET_MEAN) / IMAGENET_STD
         image = np.expand_dims(image, axis=0)
 
         image_tensor = torch.from_numpy(image).float().to(device)

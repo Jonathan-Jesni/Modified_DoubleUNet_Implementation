@@ -115,17 +115,32 @@ def main():
     samples = gather_samples()
     print(f"Total usable samples: {len(samples)}")
 
-    # 80 / 10 / 10 split
+    # 80 / 10 / 10 split, stratified by the source benign/malignant class.
+    labels = [sample["class_name"] for sample in samples]
     train_samples, temp_samples = train_test_split(
-        samples, test_size=0.20, random_state=RANDOM_STATE, shuffle=True
+        samples,
+        test_size=0.20,
+        random_state=RANDOM_STATE,
+        shuffle=True,
+        stratify=labels,
     )
+    temp_labels = [sample["class_name"] for sample in temp_samples]
     val_samples, test_samples = train_test_split(
-        temp_samples, test_size=0.50, random_state=RANDOM_STATE, shuffle=True
+        temp_samples,
+        test_size=0.50,
+        random_state=RANDOM_STATE,
+        shuffle=True,
+        stratify=temp_labels,
     )
 
-    print(f"Train: {len(train_samples)}")
-    print(f"Val  : {len(val_samples)}")
-    print(f"Test : {len(test_samples)}")
+    for split_name, split_samples in (
+        ("Train", train_samples),
+        ("Val", val_samples),
+        ("Test", test_samples),
+    ):
+        benign = sum(sample["class_name"] == "benign" for sample in split_samples)
+        malignant = sum(sample["class_name"] == "malignant" for sample in split_samples)
+        print(f"{split_name}: {len(split_samples)} (benign={benign}, malignant={malignant})")
 
     save_split("train", train_samples)
     save_split("val", val_samples)

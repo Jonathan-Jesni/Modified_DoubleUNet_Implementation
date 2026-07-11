@@ -27,6 +27,8 @@ CSV_PATH = os.path.join(OUTPUT_DIR, "metrics.csv")
 
 IMAGE_SIZE = (256, 256)
 USE_P1_TOO = False
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)[:, None, None]
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)[:, None, None]
 
 
 # =========================================================
@@ -56,6 +58,7 @@ def load_image(image_path, size):
 
     image_norm = image_resized.astype(np.float32) / 255.0
     image_chw = np.transpose(image_norm, (2, 0, 1))
+    image_chw = (image_chw - IMAGENET_MEAN) / IMAGENET_STD
     image_tensor = torch.from_numpy(image_chw).unsqueeze(0).float()
 
     return original_gray, image_resized, image_tensor

@@ -25,6 +25,8 @@ CSV_PATH = os.path.join(OUTPUT_DIR, "metrics.csv")
 IMAGE_SIZE = (256, 256)
 NUM_CLASSES = 3
 USE_P1_TOO = False
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)[:, None, None]
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)[:, None, None]
 
 
 def ensure_dirs():
@@ -45,11 +47,11 @@ def load_image(image_path, size):
     image_resized = cv2.resize(image, size)
     image_rgb = cv2.cvtColor(image_resized, cv2.COLOR_GRAY2RGB)
 
-    # FIXED: Just divide by 255.0. 
-    # REMOVED: (image_norm - 0.5) / 0.5
     image_norm = image_rgb.astype(np.float32) / 255.0
+    image_norm = np.transpose(image_norm, (2, 0, 1))
+    image_norm = (image_norm - IMAGENET_MEAN) / IMAGENET_STD
 
-    image_tensor = torch.from_numpy(np.transpose(image_norm, (2, 0, 1))).unsqueeze(0).float()
+    image_tensor = torch.from_numpy(image_norm).unsqueeze(0).float()
 
     # Return the resized grayscale version for the panel visualization
     return image_resized, image_resized, image_tensor

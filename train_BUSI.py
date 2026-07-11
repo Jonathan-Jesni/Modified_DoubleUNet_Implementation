@@ -24,6 +24,9 @@ from utils import (
 from BUSI_model import build_doubleunet
 from metrics import DiceBCELoss, MultiClassDiceLoss, CombinedLoss, BUSI_CLASS_WEIGHTS
 
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)[:, None, None]
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)[:, None, None]
+
 
 def load_data(path):
     """
@@ -105,7 +108,8 @@ class DATASET(Dataset):
 
             # --- PYTORCH IMAGE FORMATTING ---
             image = np.transpose(image, (2, 0, 1))  # Convert from HWC to CHW
-            image = image / 255.0                   # Normalize pixels to 0-1
+            image = image / 255.0                   # Scale pixels to 0-1
+            image = (image - IMAGENET_MEAN) / IMAGENET_STD
             image = torch.from_numpy(image).float() # Convert to PyTorch Tensor
 
             # --- MULTI-CLASS PIXEL MAPPING ---
@@ -293,6 +297,24 @@ if __name__ == "__main__":
     print_and_save(train_log_path, f"Device: {device}\n")
 
     model = build_doubleunet()
+    backbone_prefixes = (
+        "e1.xception",
+        "e1.dense_block2",
+        "e1.dense_block3",
+        "e1.vgg_block4",
+        "e1.vgg_block5",
+    )
+    for name, param in model.named_parameters():
+        if name.startswith(backbone_prefixes):
+            param.requires_grad = False
+
+    total_params = sum(param.numel() for param in model.parameters())
+    trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    frozen_params = total_params - trainable_params
+    print(
+        f"Model parameters - total: {total_params:,}, "
+        f"trainable: {trainable_params:,}, frozen: {frozen_params:,}"
+    )
     model = model.to(device)
     
     # RESUME LOGIC (Already working perfectly)
@@ -300,7 +322,11 @@ if __name__ == "__main__":
         print(f"--- Found existing checkpoint. Resuming from {checkpoint_path} ---")
         model.load_state_dict(torch.load(checkpoint_path, map_location=device))
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = torch.optim.Adam(
+        (param for param in model.parameters() if param.requires_grad),
+        lr=lr,
+        weight_decay=weight_decay,
+    )
     # Step on validation FOREGROUND F1 (the metric that still has headroom), not
     # val_loss. val_loss plateaus early and noisily, which with the old
     # (mode="min", patience=5, factor=0.1) config collapsed the LR to ~0 mid-run
