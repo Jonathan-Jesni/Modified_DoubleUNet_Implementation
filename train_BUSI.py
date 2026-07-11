@@ -219,12 +219,15 @@ if __name__ == "__main__":
     batch_size = 8 # SPEED PATCH 6: Increased batch size
     num_epochs = int(os.environ.get("MAX_EPOCHS", "300"))
     lr = 1e-4
-    weight_decay = 1e-5
+    weight_decay = 1e-4
     early_stopping_patience = 50
     checkpoint_path = "files/BUSI_checkpoint.pth"
     path = "dataset_seg_BUSI"
 
-    data_str = f"Image Size: {size}\nBatch Size: {batch_size}\nLR: {lr}\nEpochs: {num_epochs}\n"
+    data_str = (
+        f"Image Size: {size}\nBatch Size: {batch_size}\nLR: {lr}\n"
+        f"Weight Decay: {weight_decay}\nEpochs: {num_epochs}\n"
+    )
     data_str += f"Early Stopping Patience: {early_stopping_patience}\n"
     data_str += f"Dataset Path: {path}\n"
     print_and_save(train_log_path, data_str)
@@ -311,16 +314,12 @@ if __name__ == "__main__":
     total_params = sum(param.numel() for param in model.parameters())
     trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
     frozen_params = total_params - trainable_params
-    print(
+    parameter_summary = (
         f"Model parameters - total: {total_params:,}, "
         f"trainable: {trainable_params:,}, frozen: {frozen_params:,}"
     )
+    print_and_save(train_log_path, parameter_summary)
     model = model.to(device)
-    
-    # RESUME LOGIC (Already working perfectly)
-    if os.path.exists(checkpoint_path):
-        print(f"--- Found existing checkpoint. Resuming from {checkpoint_path} ---")
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
 
     optimizer = torch.optim.Adam(
         (param for param in model.parameters() if param.requires_grad),
@@ -340,7 +339,7 @@ if __name__ == "__main__":
     loss_fn = loss_fn.to(device)
     loss_name = "Weighted CrossEntropy + Foreground Multi-Class Dice Loss"
 
-    data_str = f"Optimizer: Adam\nLoss: {loss_name}\n"
+    data_str = f"Optimizer: Adam (fresh start)\nLoss: {loss_name}\n"
     data_str += f"CE class weights [bg, benign, malignant]: {BUSI_CLASS_WEIGHTS}\n"
     print_and_save(train_log_path, data_str)
 
