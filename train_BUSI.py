@@ -128,8 +128,21 @@ class DATASET(Dataset):
         return self.n_samples
 
 
-def train(model, loader, optimizer, loss_fn, device):
+def train(model, loader, optimizer, loss_fn, device, frozen_backbone_modules=None):
     model.train()
+
+    # Keep the frozen backbone submodules pinned in eval mode for BatchNorm
+    # purposes, even though model.train() (above) just recursively set
+    # everything - including them - back to train mode. requires_grad=False
+    # only stops weight *gradient* updates; it does NOT stop BatchNorm's
+    # running_mean/running_var from being recalculated off live batch
+    # statistics every epoch. Left unpinned, the "frozen" backbones drift away
+    # from their pretrained calibration using small, noisy batch=8 statistics
+    # that the (frozen) conv weights can never adapt to compensate for. This
+    # must be re-applied every epoch since train() is called once per epoch.
+    if frozen_backbone_modules:
+        for module in frozen_backbone_modules:
+            module.eval()
 
     epoch_loss = 0.0
     metrics_bg = [0.0, 0.0, 0.0, 0.0]   # background-inclusive (logging only)
@@ -311,6 +324,14 @@ if __name__ == "__main__":
         if name.startswith(backbone_prefixes):
             param.requires_grad = False
 
+    # Same submodules as the freeze loop above (exact name match against
+    # backbone_prefixes), kept as module references so their BatchNorm layers
+    # can be pinned to eval mode every epoch - see the comment in train().
+    frozen_backbone_modules = [
+        module for name, module in model.named_modules()
+        if name in backbone_prefixes
+    ]
+
     total_params = sum(param.numel() for param in model.parameters())
     trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
     frozen_params = total_params - trainable_params
@@ -350,7 +371,9 @@ if __name__ == "__main__":
     for epoch in range(num_epochs):
         start_time = time.time()
 
-        train_loss, train_bg, train_fg = train(model, train_loader, optimizer, loss_fn, device)
+        train_loss, train_bg, train_fg = train(
+            model, train_loader, optimizer, loss_fn, device, frozen_backbone_modules
+        )
         valid_loss, valid_bg, valid_fg = evaluate(model, valid_loader, loss_fn, device)
         lr_before = optimizer.param_groups[0]["lr"]
         scheduler.step(valid_fg[1])

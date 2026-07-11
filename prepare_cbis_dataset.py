@@ -365,6 +365,23 @@ def main():
 
     print(f"Total usable samples found: {len(all_samples)}")
 
+    # 2. Filter to MASS-only samples BEFORE the patient split. train_CBIS.py,
+    # test_CBIS.py, and predict_CBIS.py all unconditionally filter to mass-only
+    # at runtime (CALC support was deliberately removed from training) - CALC
+    # samples are never consumed anywhere downstream. Keeping calc-only patients
+    # in the split pool risks GroupShuffleSplit (which is patient-grouped but has
+    # no awareness of mass/calc composition) assigning an entire split only
+    # calc-only patients by chance, producing a val or test set with ZERO mass
+    # samples (observed: a full training run crashed with "val: MASS samples = 0"
+    # -> ZeroDivisionError in evaluate()). Filtering here makes every sample in
+    # the split pool mass-type by construction, so this failure mode cannot recur
+    # regardless of random_state or which patients land where.
+    all_samples = [
+        sample for sample in all_samples
+        if "mass" in sample["image_path"].name.lower()
+    ]
+    print(f"Mass-only samples after filtering: {len(all_samples)}")
+
     patient_examples = [
         f"{sample['image_path'].name} -> {extract_patient_id(sample['image_path'])}"
         for sample in all_samples[:5]
