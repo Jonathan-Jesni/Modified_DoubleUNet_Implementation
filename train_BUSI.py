@@ -215,6 +215,7 @@ if __name__ == "__main__":
     batch_size = 8 # SPEED PATCH 6: Increased batch size
     num_epochs = int(os.environ.get("MAX_EPOCHS", "300"))
     lr = 1e-4
+    weight_decay = 1e-5
     early_stopping_patience = 50
     checkpoint_path = "files/BUSI_checkpoint.pth"
     path = "dataset_seg_BUSI"
@@ -299,7 +300,7 @@ if __name__ == "__main__":
         print(f"--- Found existing checkpoint. Resuming from {checkpoint_path} ---")
         model.load_state_dict(torch.load(checkpoint_path, map_location=device))
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     # Step on validation FOREGROUND F1 (the metric that still has headroom), not
     # val_loss. val_loss plateaus early and noisily, which with the old
     # (mode="min", patience=5, factor=0.1) config collapsed the LR to ~0 mid-run
