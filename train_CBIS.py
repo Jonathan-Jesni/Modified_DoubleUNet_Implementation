@@ -327,10 +327,13 @@ if __name__ == "__main__":
         model.load_state_dict(torch.load(checkpoint_path, map_location=device))
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # Step on validation FOREGROUND F1 (the metric that still has headroom), not
+    # val_loss. val_loss plateaus early and noisily, which with the old
+    # (mode="min", patience=5, factor=0.1) config collapsed the LR to ~0 mid-run
+    # and froze training. mode="max" + higher patience + gentler factor keeps the
+    # LR alive while genuinely reducing it only on a real fg-F1 plateau.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        patience=5
+        optimizer, mode="max", patience=12, factor=0.5
     )
 
     loss_fn = CombinedLoss(num_classes=NUM_CLASSES, class_weights=CBIS_CLASS_WEIGHTS)
@@ -349,7 +352,8 @@ if __name__ == "__main__":
         train_loss, train_bg, train_fg = train(model, train_loader, optimizer, loss_fn, device)
         valid_loss, valid_bg, valid_fg = evaluate(model, valid_loader, loss_fn, device)
 
-        scheduler.step(valid_loss)
+        lr_before = optimizer.param_groups[0]["lr"]
+        scheduler.step(valid_fg[1])
 
         # Checkpoint / early-stopping decision is driven by FOREGROUND-only F1
         # (lesions), not the background-inclusive number.
@@ -368,7 +372,7 @@ if __name__ == "__main__":
 
         epoch_mins, epoch_secs = epoch_time(start_time, time.time())
 
-        data_str = f"Epoch: {epoch + 1:02} | Epoch Time: {epoch_mins}m {epoch_secs}s\n"
+        data_str = f"Epoch: {epoch + 1:02} | Epoch Time: {epoch_mins}m {epoch_secs}s | LR: {lr_before:.2e}\n"
         data_str += (
             f"\tTrain Loss: {train_loss:.4f}\n"
             f"\t  [fg]  Jaccard: {train_fg[0]:.4f} - F1: {train_fg[1]:.4f} - "
