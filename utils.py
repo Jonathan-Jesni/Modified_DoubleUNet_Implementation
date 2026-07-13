@@ -17,6 +17,8 @@ def seeding(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
+    # For fully deterministic behavior, benchmark must be False
+    torch.backends.cudnn.benchmark = False
 
 """ Create a directory """
 def create_dir(path):

@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from CBIS_model import build_doubleunet
-from utils import calculate_metrics
+from utils import calculate_foreground_metrics
 
 
 CHECKPOINT_PATH = "files/CBIS_checkpoint.pth"
@@ -22,7 +22,7 @@ OVERLAY_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "overlays")
 PANEL_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "panels")
 CSV_PATH = os.path.join(OUTPUT_DIR, "metrics.csv")
 
-IMAGE_SIZE = (256, 256)
+IMAGE_SIZE = (512, 512)
 NUM_CLASSES = 3
 USE_P1_TOO = False
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)[:, None, None]
@@ -175,12 +175,12 @@ def main():
 
             gt_tensor = torch.from_numpy(gt).to(device)
             pred_tensor = torch.from_numpy(pred).to(device)
-            jac, f1, rec, prec = calculate_metrics(gt_tensor, pred_tensor)
+            jac, f1, rec, prec = calculate_foreground_metrics(gt_tensor, pred_tensor)
 
             # Sum probabilities of lesion classes (1 and 2) for heat map
             prob_vis = (np.sum(prob[1:], axis=0) * 255).astype(np.uint8)
 
-            cv2.imwrite(os.path.join(MASK_OUTPUT_DIR, name), pred)
+            cv2.imwrite(os.path.join(MASK_OUTPUT_DIR, name), (pred * 127).astype(np.uint8))
             cv2.imwrite(os.path.join(PROB_OUTPUT_DIR, name), prob_vis)
             cv2.imwrite(os.path.join(OVERLAY_OUTPUT_DIR, name), make_overlay(gray, pred))
 

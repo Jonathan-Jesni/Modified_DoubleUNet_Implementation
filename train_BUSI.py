@@ -128,7 +128,7 @@ class DATASET(Dataset):
         return self.n_samples
 
 
-def train(model, loader, optimizer, loss_fn, device, frozen_backbone_modules=None):
+def train(model, loader, optimizer, loss_fn, device, scaler, frozen_backbone_modules=None):
     model.train()
 
     # Keep the frozen backbone submodules pinned in eval mode for BatchNorm
@@ -148,8 +148,7 @@ def train(model, loader, optimizer, loss_fn, device, frozen_backbone_modules=Non
     metrics_bg = [0.0, 0.0, 0.0, 0.0]   # background-inclusive (logging only)
     metrics_fg = [0.0, 0.0, 0.0, 0.0]   # foreground-only (drives checkpoint/early-stop)
 
-    # SPEED PATCH 1: Initialize AMP Scaler
-    scaler = torch.amp.GradScaler('cuda')
+    # SPEED PATCH 1: Use provided AMP Scaler
 
     for x, y in loader:
         x = x.to(device, dtype=torch.float32)
@@ -161,10 +160,12 @@ def train(model, loader, optimizer, loss_fn, device, frozen_backbone_modules=Non
         # SPEED PATCH 3: autocast for 16-bit math
         with torch.amp.autocast('cuda'):
             p1, p2 = model(x)
-            loss = loss_fn(p1, y) + loss_fn(p2, y)
+            loss = 0.4 * loss_fn(p1, y) + 1.0 * loss_fn(p2, y)
 
         # SPEED PATCH 4: Scaled backward pass
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
 
@@ -189,12 +190,11 @@ def evaluate(model, loader, loss_fn, device):
 
     with torch.no_grad():
         for x, y in loader:
-            # SPEED PATCH 5: Autocast for validation phase
             with torch.amp.autocast('cuda'):
                 x = x.to(device, dtype=torch.float32)
                 y = y.to(device, dtype=torch.long)
                 p1, p2 = model(x)
-                loss = loss_fn(p1, y) + loss_fn(p2, y)
+                loss = 0.4 * loss_fn(p1, y) + 1.0 * loss_fn(p2, y)
 
             epoch_loss += loss.item()
 
@@ -275,9 +275,17 @@ if __name__ == "__main__":
         )
 
     transform = A.Compose([
-        A.Rotate(limit=20, p=0.3, border_mode=cv2.BORDER_REFLECT_101),
         A.HorizontalFlip(p=0.5),
-        A.VerticalFlip(p=0.2),
+        A.VerticalFlip(p=0.3),
+        A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.15, rotate_limit=25,
+                           border_mode=cv2.BORDER_REFLECT_101, p=0.5),
+        A.ElasticTransform(alpha=120, sigma=120*0.05,
+                           border_mode=cv2.BORDER_REFLECT_101, p=0.2),
+        A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.2),
+        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.4),
+        A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+        A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+        A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.3),
         coarse_dropout,
     ])
 
@@ -307,8 +315,8 @@ if __name__ == "__main__":
     # Model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # SPEED PATCH 8: cuDNN Benchmarking
-    torch.backends.cudnn.benchmark = True 
+    use_cuda_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_cuda_amp)
     
     print_and_save(train_log_path, f"Device: {device}\n")
 
@@ -372,7 +380,7 @@ if __name__ == "__main__":
         start_time = time.time()
 
         train_loss, train_bg, train_fg = train(
-            model, train_loader, optimizer, loss_fn, device, frozen_backbone_modules
+            model, train_loader, optimizer, loss_fn, device, scaler, frozen_backbone_modules
         )
         valid_loss, valid_bg, valid_fg = evaluate(model, valid_loader, loss_fn, device)
         lr_before = optimizer.param_groups[0]["lr"]

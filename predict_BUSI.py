@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from BUSI_model import build_doubleunet
-from utils import calculate_metrics
+from utils import calculate_foreground_metrics
 
 
 # =========================================================
@@ -273,7 +273,7 @@ def main():
             gt_tensor = torch.from_numpy(gt_classes).to(device)
             pred_tensor = torch.from_numpy(pred_classes).to(device)
 
-            m_jaccard, m_f1, m_recall, m_precision = calculate_metrics(
+            m_jaccard, m_f1, m_recall, m_precision = calculate_foreground_metrics(
                 gt_tensor,
                 pred_tensor
             )

@@ -15,7 +15,7 @@ from utils import create_dir, seeding, calculate_foreground_metrics
 
 
 NUM_CLASSES = 3
-SIZE = (256, 256)
+SIZE = (512, 512)
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)[:, None, None]
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)[:, None, None]
 
@@ -186,6 +186,7 @@ def evaluate(model, save_path, test_x, test_y, size, device):
             start_time = time.time()
 
             y_pred1, y_pred2 = model(image_tensor)
+            _ = 0.4 * y_pred1 + 1.0 * y_pred2
 
             end_time = time.time() - start_time
             time_taken.append(end_time)

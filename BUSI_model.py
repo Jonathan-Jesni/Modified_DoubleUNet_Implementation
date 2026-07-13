@@ -113,24 +113,26 @@ class encoder1(nn.Module):
         self.proj1 = nn.Conv2d(64, 64, kernel_size=1)
 
     def forward(self, x):
+        input_h, input_w = x.shape[2], x.shape[3]
+
         # Block 1: Xception
         xcept_features = self.xception(x)
         x1_raw = xcept_features[0] 
         x1 = self.proj1(x1_raw)
         
-        # Force Block 1 to the canonical 256x256 for the first skip connection
-        x1 = F.interpolate(x1, size=(256, 256), mode='bilinear', align_corners=False)
+        # Force Block 1 to the canonical size for the first skip connection
+        x1 = F.interpolate(x1, size=(input_h, input_w), mode='bilinear', align_corners=False)
 
-        # Block 2: DenseNet (naturally pools 256x256 to 128x128)
+        # Block 2: DenseNet (naturally pools to H/2 x W/2)
         x2 = self.dense_block2(x1)
 
-        # Block 3: DenseNet (naturally pools 128x128 to 64x64)
+        # Block 3: DenseNet (naturally pools to H/4 x W/4)
         x3 = self.dense_block3(x2)
 
-        # Block 4: VGG-19 (naturally pools 64x64 to 32x32)
+        # Block 4: VGG-19 (naturally pools to H/8 x W/8)
         x4 = self.vgg_block4(x3)
 
-        # Block 5: VGG-19 (naturally pools 32x32 to 16x16)
+        # Block 5: VGG-19 (naturally pools to H/16 x W/16)
         x5 = self.vgg_block5(x4)
 
         return x5, [x4, x3, x2, x1]
@@ -141,28 +143,32 @@ class decoder1(nn.Module):
 
         self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
         self.c1 = conv_block(64+512, 256)
+        self.drop1 = nn.Dropout2d(p=0.15)
         self.c2 = conv_block(512, 128)
+        self.drop2 = nn.Dropout2d(p=0.15)
         self.c3 = conv_block(256, 64)
+        self.drop3 = nn.Dropout2d(p=0.15)
         self.c4 = conv_block(128, 32)
+        self.drop4 = nn.Dropout2d(p=0.15)
 
     def forward(self, x, skip):
         s1, s2, s3, s4 = skip
 
         x = self.up(x)
         x = torch.cat([x, s1], axis=1)
-        x = self.c1(x)
+        x = self.drop1(self.c1(x))
 
         x = self.up(x)
         x = torch.cat([x, s2], axis=1)
-        x = self.c2(x)
+        x = self.drop2(self.c2(x))
 
         x = self.up(x)
         x = torch.cat([x, s3], axis=1)
-        x = self.c3(x)
+        x = self.drop3(self.c3(x))
 
         x = self.up(x)
         x = torch.cat([x, s4], axis=1)
-        x = self.c4(x)
+        x = self.drop4(self.c4(x))
 
         return x
 
@@ -200,27 +206,31 @@ class decoder2(nn.Module):
 
         self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
         self.c1 = conv_block(832, 256)
+        self.drop1 = nn.Dropout2d(p=0.15)
         self.c2 = conv_block(640, 128)
+        self.drop2 = nn.Dropout2d(p=0.15)
         self.c3 = conv_block(320, 64)
+        self.drop3 = nn.Dropout2d(p=0.15)
         self.c4 = conv_block(160, 32)
+        self.drop4 = nn.Dropout2d(p=0.15)
 
     def forward(self, x, skip1, skip2):
 
         x = self.up(x)
         x = torch.cat([x, skip1[0], skip2[0]], axis=1)
-        x = self.c1(x)
+        x = self.drop1(self.c1(x))
 
         x = self.up(x)
         x = torch.cat([x, skip1[1], skip2[1]], axis=1)
-        x = self.c2(x)
+        x = self.drop2(self.c2(x))
 
         x = self.up(x)
         x = torch.cat([x, skip1[2], skip2[2]], axis=1)
-        x = self.c3(x)
+        x = self.drop3(self.c3(x))
 
         x = self.up(x)
         x = torch.cat([x, skip1[3], skip2[3]], axis=1)
-        x = self.c4(x)
+        x = self.drop4(self.c4(x))
 
         return x
 
