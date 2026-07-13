@@ -274,6 +274,11 @@ if __name__ == "__main__":
             p=0.2,
         )
 
+    try:
+        gauss_noise = A.GaussNoise(std_range=(0.012, 0.028), p=0.3)
+    except TypeError:
+        gauss_noise = A.GaussNoise(var_limit=(10.0, 50.0), p=0.3)
+
     transform = A.Compose([
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.3),
@@ -283,7 +288,7 @@ if __name__ == "__main__":
                            border_mode=cv2.BORDER_REFLECT_101, p=0.2),
         A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.2),
         A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.4),
-        A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+        gauss_noise,
         A.GaussianBlur(blur_limit=(3, 5), p=0.2),
         A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.3),
         coarse_dropout,
@@ -349,6 +354,10 @@ if __name__ == "__main__":
     )
     print_and_save(train_log_path, parameter_summary)
     model = model.to(device)
+
+    if os.path.exists(checkpoint_path):
+        print(f"--- Removing old checkpoint {checkpoint_path} ---")
+        os.remove(checkpoint_path)
 
     optimizer = torch.optim.Adam(
         (param for param in model.parameters() if param.requires_grad),
