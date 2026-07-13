@@ -143,32 +143,28 @@ class decoder1(nn.Module):
 
         self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
         self.c1 = conv_block(64+512, 256)
-        self.drop1 = nn.Dropout2d(p=0.15)
         self.c2 = conv_block(512, 128)
-        self.drop2 = nn.Dropout2d(p=0.15)
         self.c3 = conv_block(256, 64)
-        self.drop3 = nn.Dropout2d(p=0.15)
         self.c4 = conv_block(128, 32)
-        self.drop4 = nn.Dropout2d(p=0.15)
 
     def forward(self, x, skip):
         s1, s2, s3, s4 = skip
 
         x = self.up(x)
         x = torch.cat([x, s1], axis=1)
-        x = self.drop1(self.c1(x))
+        x = self.c1(x)
 
         x = self.up(x)
         x = torch.cat([x, s2], axis=1)
-        x = self.drop2(self.c2(x))
+        x = self.c2(x)
 
         x = self.up(x)
         x = torch.cat([x, s3], axis=1)
-        x = self.drop3(self.c3(x))
+        x = self.c3(x)
 
         x = self.up(x)
         x = torch.cat([x, s4], axis=1)
-        x = self.drop4(self.c4(x))
+        x = self.c4(x)
 
         return x
 
@@ -206,31 +202,27 @@ class decoder2(nn.Module):
 
         self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
         self.c1 = conv_block(832, 256)
-        self.drop1 = nn.Dropout2d(p=0.15)
         self.c2 = conv_block(640, 128)
-        self.drop2 = nn.Dropout2d(p=0.15)
         self.c3 = conv_block(320, 64)
-        self.drop3 = nn.Dropout2d(p=0.15)
         self.c4 = conv_block(160, 32)
-        self.drop4 = nn.Dropout2d(p=0.15)
 
     def forward(self, x, skip1, skip2):
 
         x = self.up(x)
         x = torch.cat([x, skip1[0], skip2[0]], axis=1)
-        x = self.drop1(self.c1(x))
+        x = self.c1(x)
 
         x = self.up(x)
         x = torch.cat([x, skip1[1], skip2[1]], axis=1)
-        x = self.drop2(self.c2(x))
+        x = self.c2(x)
 
         x = self.up(x)
         x = torch.cat([x, skip1[2], skip2[2]], axis=1)
-        x = self.drop3(self.c3(x))
+        x = self.c3(x)
 
         x = self.up(x)
         x = torch.cat([x, skip1[3], skip2[3]], axis=1)
-        x = self.drop4(self.c4(x))
+        x = self.c4(x)
 
         return x
 

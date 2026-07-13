@@ -160,7 +160,7 @@ def train(model, loader, optimizer, loss_fn, device, scaler, frozen_backbone_mod
         # SPEED PATCH 3: autocast for 16-bit math
         with torch.amp.autocast('cuda'):
             p1, p2 = model(x)
-            loss = 0.4 * loss_fn(p1, y) + 1.0 * loss_fn(p2, y)
+            loss = 1.0 * loss_fn(p1, y) + 1.0 * loss_fn(p2, y)
 
         # SPEED PATCH 4: Scaled backward pass
         scaler.scale(loss).backward()
@@ -194,7 +194,7 @@ def evaluate(model, loader, loss_fn, device):
                 x = x.to(device, dtype=torch.float32)
                 y = y.to(device, dtype=torch.long)
                 p1, p2 = model(x)
-                loss = 0.4 * loss_fn(p1, y) + 1.0 * loss_fn(p2, y)
+                loss = 1.0 * loss_fn(p1, y) + 1.0 * loss_fn(p2, y)
 
             epoch_loss += loss.item()
 
@@ -256,42 +256,13 @@ if __name__ == "__main__":
     print_and_save(train_log_path, data_str)
 
     # Data augmentation
-    # CoarseDropout's kwargs changed in albumentations >=1.4 (range tuples) vs the
-    # older scalar API (<1.4). Build it compatibly so the same script runs on both
-    # the local venv (1.3.x) and the cloud env (2.x).
-    try:
-        coarse_dropout = A.CoarseDropout(
-            num_holes_range=(1, 8),
-            hole_height_range=(1, 24),
-            hole_width_range=(1, 24),
-            p=0.2,
-        )
-    except TypeError:
-        coarse_dropout = A.CoarseDropout(
-            min_holes=1, max_holes=8,
-            min_height=1, max_height=24,
-            min_width=1, max_width=24,
-            p=0.2,
-        )
-
-    try:
-        gauss_noise = A.GaussNoise(std_range=(0.012, 0.028), p=0.3)
-    except TypeError:
-        gauss_noise = A.GaussNoise(var_limit=(10.0, 50.0), p=0.3)
-
     transform = A.Compose([
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.3),
         A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.15, rotate_limit=25,
                            border_mode=cv2.BORDER_REFLECT_101, p=0.5),
-        A.ElasticTransform(alpha=120, sigma=120*0.05,
-                           border_mode=cv2.BORDER_REFLECT_101, p=0.2),
-        A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.2),
         A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.4),
-        gauss_noise,
-        A.GaussianBlur(blur_limit=(3, 5), p=0.2),
         A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.3),
-        coarse_dropout,
     ])
 
     # Dataset and loader
