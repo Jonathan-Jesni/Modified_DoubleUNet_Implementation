@@ -297,24 +297,7 @@ if __name__ == "__main__":
     print_and_save(train_log_path, f"Device: {device}\n")
 
     model = build_doubleunet()
-    backbone_prefixes = (
-        "e1.xception",
-        "e1.dense_block2",
-        "e1.dense_block3",
-        "e1.vgg_block4",
-        "e1.vgg_block5",
-    )
-    for name, param in model.named_parameters():
-        if name.startswith(backbone_prefixes):
-            param.requires_grad = False
 
-    # Same submodules as the freeze loop above (exact name match against
-    # backbone_prefixes), kept as module references so their BatchNorm layers
-    # can be pinned to eval mode every epoch - see the comment in train().
-    frozen_backbone_modules = [
-        module for name, module in model.named_modules()
-        if name in backbone_prefixes
-    ]
 
     total_params = sum(param.numel() for param in model.parameters())
     trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
@@ -360,7 +343,7 @@ if __name__ == "__main__":
         start_time = time.time()
 
         train_loss, train_bg, train_fg = train(
-            model, train_loader, optimizer, loss_fn, device, scaler, frozen_backbone_modules
+            model, train_loader, optimizer, loss_fn, device, scaler
         )
         valid_loss, valid_bg, valid_fg = evaluate(model, valid_loader, loss_fn, device)
         lr_before = optimizer.param_groups[0]["lr"]
