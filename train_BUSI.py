@@ -128,21 +128,8 @@ class DATASET(Dataset):
         return self.n_samples
 
 
-def train(model, loader, optimizer, loss_fn, device, scaler, frozen_backbone_modules=None):
+def train(model, loader, optimizer, loss_fn, device, scaler):
     model.train()
-
-    # Keep the frozen backbone submodules pinned in eval mode for BatchNorm
-    # purposes, even though model.train() (above) just recursively set
-    # everything - including them - back to train mode. requires_grad=False
-    # only stops weight *gradient* updates; it does NOT stop BatchNorm's
-    # running_mean/running_var from being recalculated off live batch
-    # statistics every epoch. Left unpinned, the "frozen" backbones drift away
-    # from their pretrained calibration using small, noisy batch=8 statistics
-    # that the (frozen) conv weights can never adapt to compensate for. This
-    # must be re-applied every epoch since train() is called once per epoch.
-    if frozen_backbone_modules:
-        for module in frozen_backbone_modules:
-            module.eval()
 
     epoch_loss = 0.0
     metrics_bg = [0.0, 0.0, 0.0, 0.0]   # background-inclusive (logging only)
