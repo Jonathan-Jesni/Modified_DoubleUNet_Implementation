@@ -78,19 +78,26 @@ files/
 # Dataset Files (large local data)
 # ==================================================
 dataset_seg_BUSI/
+dataset_seg_BUSI_v2*/
 dataset_seg_CBIS/
 CBIS_dataset/
 BUSI_dataset/
+CBIS_dataset.rar
+CBIS_dataset.zip
+dataset_seg_CBIS.zip
+dataset_seg_BUSI.rar
 images/
 masks/
 
 # ==================================================
 # Temporary Files
 # ==================================================
+.legacy_archive/
 *.tmp
 *.temp
 *.bak
 *.swp
+.tmp_visual/
 
 # ==================================================
 # Environment / Secrets

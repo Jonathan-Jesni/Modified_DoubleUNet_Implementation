@@ -1,288 +1,403 @@
-import os, time
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+"""Calibrate and test the corrected BUSI model; no arguments are required."""
 
-from operator import add
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+from typing import Any, Mapping
+
 import numpy as np
-import cv2
-from tqdm import tqdm
 import torch
+from torch.utils.data import DataLoader
 
-from BUSI_model import build_doubleunet
-from utils import create_dir, seeding, calculate_foreground_metrics
-from train_BUSI import load_data
-
-IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)[:, None, None]
-IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)[:, None, None]
-
-
-COLOR_MAP = {
-    0: (0, 0, 0),       # background = black
-    1: (0, 255, 0),     # benign = green
-    2: (0, 0, 255),     # malignant = red
-}
-
-
-def print_model_parameters(model):
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    non_trainable_params = total_params - trainable_params
-
-    print("\n================ MODEL INFO ================")
-    print(f"Total Parameters        : {total_params:,}")
-    print(f"Trainable Parameters    : {trainable_params:,}")
-    print(f"Non-trainable Parameters: {non_trainable_params:,}")
-    print("===========================================\n")
+from BUSI_model import build_doubleunet, configure_screening_architecture
+from busi_evaluation import (
+    apply_foreground_threshold,
+    evaluate_probabilities,
+    sweep_foreground_thresholds,
+)
+from busi_runtime import (
+    ManifestSegmentationDataset,
+    atomic_json_dump,
+    canonical_sha256,
+    load_json,
+    sha256_file,
+    split_membership_hash,
+    validate_dataset_contract,
+    verify_generated_artifacts,
+    worker_seed_init,
+)
+from train_BUSI import write_deploy_checkpoint
 
 
-def class_to_gray(mask):
-    mask = (mask * 127).astype(np.uint8)
-    mask = np.expand_dims(mask, axis=-1)
-    mask = np.concatenate([mask, mask, mask], axis=2)
-    return mask
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run-dir", default="runs/BUSI")
+    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--num-workers", type=int, default=2)
+    return parser.parse_args()
 
 
-def class_to_color(mask):
-    color_mask = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
+def _metadata_values(metadata: Mapping[str, Any], key: str) -> list[Any]:
+    value = metadata[key]
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().reshape(-1).tolist()
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
 
-    for class_id, color in COLOR_MAP.items():
-        color_mask[mask == class_id] = color
 
-    return color_mask
+def _quartile_number(value: Any) -> int:
+    text = str(value).strip().upper()
+    if text in {"", "NORMAL", "NONE", "0"}:
+        return 0
+    if text.startswith("Q"):
+        text = text[1:]
+    quartile = int(text)
+    if quartile not in {1, 2, 3, 4}:
+        raise ValueError(f"Unexpected lesion-size quartile: {value!r}")
+    return quartile
 
 
-def print_score(metrics_score, num_samples):
-    jaccard = metrics_score[0] / num_samples
-    f1 = metrics_score[1] / num_samples
-    recall = metrics_score[2] / num_samples
-    precision = metrics_score[3] / num_samples
+def _candidate_paths(run_dir: Path, explicit: str | None) -> list[Path]:
+    if explicit:
+        path = Path(explicit).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        try:
+            path.relative_to(run_dir)
+        except ValueError as exc:
+            raise RuntimeError("Checkpoint must belong to the selected run directory") from exc
+        return [path]
+    last_path = run_dir / "last.pt"
+    if not last_path.is_file():
+        raise FileNotFoundError(f"Train first; missing checkpoint: {last_path}")
+    last = torch.load(last_path, map_location="cpu", weights_only=False)
+    paths = [Path(item["path"]).resolve() for item in last.get("candidate_checkpoints", [])]
+    paths = [path for path in paths if path.is_file()]
+    if paths:
+        return paths[:3]
+    best = run_dir / "best_primary.pt"
+    return [best.resolve()] if best.is_file() else [last_path.resolve()]
 
-    print(
-        f"Jaccard/IoU: {jaccard:1.4f} - "
-        f"Dice/F1: {f1:1.4f} - "
-        f"Recall: {recall:1.4f} - "
-        f"Precision: {precision:1.4f}"
+
+def _load_model(checkpoint_path: Path, config: Mapping[str, Any], device: torch.device):
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if "model_state_dict" not in checkpoint:
+        raise RuntimeError(f"Not a full BUSI checkpoint: {checkpoint_path}")
+    if checkpoint.get("config_hash") != canonical_sha256(config):
+        raise RuntimeError(f"Checkpoint configuration does not match this run: {checkpoint_path}")
+    if checkpoint.get("run_id") != config.get("run_id"):
+        raise RuntimeError(f"Checkpoint run ID does not match this run: {checkpoint_path}")
+    model = build_doubleunet(
+        variant=config["variant"],
+        num_classes=3,
+        preprocessing_profile=config["dataset"]["preprocessing_profile"],
+        input_size=config["dataset"]["input_size"],
+        pretrained=False,
+        bn_policy=(
+            "targeted"
+            if config["model"]["fine_tuning"]["targeted_bn_policy"]
+            else "legacy"
+        ),
+    )
+    configure_screening_architecture(model, config["model"]["architecture_mode"])
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    model.to(device).eval()
+    return model, checkpoint
+
+
+def _collect(
+    checkpoint_path: Path,
+    dataset: ManifestSegmentationDataset,
+    config: Mapping[str, Any],
+    device: torch.device,
+    batch_size: int,
+    num_workers: int,
+) -> dict[str, Any]:
+    model, checkpoint = _load_model(checkpoint_path, config, device)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+        worker_init_fn=worker_seed_init,
+    )
+    p1_values, p2_values, targets = [], [], []
+    class_ids, sample_ids, lesion_quartiles = [], [], []
+    with torch.inference_mode():
+        for images, masks, metadata in loader:
+            images = images.to(device, non_blocking=True)
+            p1_logits, p2_logits = model(images)
+            p1_values.append(torch.softmax(p1_logits, dim=1).cpu().numpy())
+            p2_values.append(torch.softmax(p2_logits, dim=1).cpu().numpy())
+            targets.append(masks.numpy())
+            class_ids.extend(int(value) for value in _metadata_values(metadata, "class_id"))
+            sample_ids.extend(str(value) for value in _metadata_values(metadata, "sample_id"))
+            lesion_quartiles.extend(
+                _quartile_number(value)
+                for value in _metadata_values(metadata, "lesion_size_quartile")
+            )
+    del model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return {
+        "p1": np.concatenate(p1_values),
+        "p2": np.concatenate(p2_values),
+        "targets": np.concatenate(targets),
+        "class_ids": np.asarray(class_ids, dtype=np.int64),
+        "sample_ids": np.asarray(sample_ids),
+        "lesion_quartiles": np.asarray(lesion_quartiles, dtype=np.int64),
+        "epoch": int(checkpoint.get("epoch", -1)),
+    }
+
+
+def _overlap_values(target: np.ndarray, prediction: np.ndarray) -> dict[str, Any]:
+    target_fg = target != 0
+    prediction_fg = prediction != 0
+    tp = int(np.logical_and(target_fg, prediction_fg).sum())
+    fp = int(np.logical_and(~target_fg, prediction_fg).sum())
+    fn = int(np.logical_and(target_fg, ~prediction_fg).sum())
+    binary_dice = (2.0 * tp / (2 * tp + fp + fn)) if (2 * tp + fp + fn) else None
+    binary_iou = (tp / (tp + fp + fn)) if (tp + fp + fn) else None
+    binary_precision = (tp / (tp + fp)) if (tp + fp) else (0.0 if fn else None)
+    binary_recall = (tp / (tp + fn)) if (tp + fn) else None
+    return {
+        "binary_dice": binary_dice,
+        "binary_iou": binary_iou,
+        "binary_precision": binary_precision,
+        "binary_recall": binary_recall,
+    }
+
+
+def _per_image_rows(bundle: Mapping[str, Any], threshold: float, head: str):
+    predictions = apply_foreground_threshold(bundle[head], threshold)
+    rows = []
+    for index, prediction in enumerate(predictions):
+        target = bundle["targets"][index]
+        class_id = int(bundle["class_ids"][index])
+        foreground_counts = [int((prediction == value).sum()) for value in (1, 2)]
+        predicted_diagnosis = int(np.argmax(foreground_counts)) + 1 if any(foreground_counts) else 0
+        row = {
+            "sample_id": str(bundle["sample_ids"][index]),
+            "class_id": class_id,
+            "lesion_size_quartile": int(bundle["lesion_quartiles"][index]),
+            "predicted_diagnosis": predicted_diagnosis,
+            "normal_empty": bool(not np.any(prediction)) if class_id == 0 else None,
+            "predicted_foreground_fraction": float((prediction != 0).mean()),
+            "ground_truth_foreground_fraction": float((target != 0).mean()),
+            **_overlap_values(target, prediction),
+        }
+        if class_id:
+            target_class = target == class_id
+            predicted_class = prediction == class_id
+            tp = int(np.logical_and(target_class, predicted_class).sum())
+            fp = int(np.logical_and(~target_class, predicted_class).sum())
+            fn = int(np.logical_and(target_class, ~predicted_class).sum())
+            denominator = 2 * tp + fp + fn
+            row["diagnosis_class_dice"] = (
+                2.0 * tp / denominator if denominator else None
+            )
+        else:
+            row["diagnosis_class_dice"] = None
+        rows.append(row)
+    return rows
+
+
+def _quartile_metrics(bundle: Mapping[str, Any], threshold: float, head: str):
+    output = {}
+    for quartile in (1, 2, 3, 4):
+        indices = np.flatnonzero(bundle["lesion_quartiles"] == quartile)
+        if not len(indices):
+            continue
+        output[f"Q{quartile}"] = evaluate_probabilities(
+            bundle[head][indices],
+            bundle["targets"][indices],
+            class_ids=bundle["class_ids"][indices],
+            sample_ids=bundle["sample_ids"][indices],
+            threshold=threshold,
+            compute_surface=False,
+        )
+    return output
+
+
+def _dataset(config: Mapping[str, Any], split: str) -> ManifestSegmentationDataset:
+    return ManifestSegmentationDataset(
+        config["dataset"]["manifest"],
+        split=split,
+        outer_fold=int(config["outer_fold"]),
+        preprocessing_profile=config["dataset"]["preprocessing_profile"],
+        input_size=config["dataset"]["input_size"],
+        augmentation=None,
     )
 
 
-def dice_per_class(pred, target, class_id, eps=1e-7):
-    pred_c = pred == class_id
-    target_c = target == class_id
+def main() -> None:
+    args = parse_args()
+    run_dir = Path(args.run_dir).resolve()
+    config_path = run_dir / "resolved_config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Train first; missing configuration: {config_path}")
+    config = load_json(config_path)
+    manifest = Path(config["dataset"]["manifest"]).resolve()
+    dataset_metadata = validate_dataset_contract(
+        manifest,
+        require_completed_review=True,
+        expected_counts=config["dataset"].get("expected_counts"),
+    )
+    verify_generated_artifacts(manifest)
 
-    intersection = np.logical_and(pred_c, target_c).sum()
-    total = pred_c.sum() + target_c.sum()
-
-    if total == 0:
-        return np.nan
-
-    return (2 * intersection + eps) / (total + eps)
-
-
-def iou_per_class(pred, target, class_id, eps=1e-7):
-    pred_c = pred == class_id
-    target_c = target == class_id
-
-    intersection = np.logical_and(pred_c, target_c).sum()
-    union = np.logical_or(pred_c, target_c).sum()
-
-    if union == 0:
-        return np.nan
-
-    return (intersection + eps) / (union + eps)
-
-
-def evaluate(model, save_path, test_x, test_y, size, device):
-    metrics_score_1 = [0.0, 0.0, 0.0, 0.0]
-    metrics_score_2 = [0.0, 0.0, 0.0, 0.0]
-
-    class_dice = {0: [], 1: [], 2: []}
-    class_iou = {0: [], 1: [], 2: []}
-
-    time_taken = []
-
-    for i, (x, y) in tqdm(enumerate(zip(test_x, test_y)), total=len(test_x)):
-        name = os.path.basename(x)
-
-        # ---------------- Image ----------------
-        # Read grayscale then expand to 3 identical channels, matching
-        # train_BUSI / predict_BUSI exactly (avoids any BGR-vs-RGB divergence).
-        image_gray = cv2.imread(x, cv2.IMREAD_GRAYSCALE)
-        if image_gray is None:
-            raise ValueError(f"Failed to read image: {x}")
-        image = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2RGB)
-        image = cv2.resize(image, size)
-
-        save_img = image.copy()
-
-        image_input = np.transpose(image, (2, 0, 1))
-        image_input = np.expand_dims(image_input, axis=0)
-        image_input = image_input / 255.0
-        image_input = (image_input - IMAGENET_MEAN) / IMAGENET_STD
-        image_input = image_input.astype(np.float32)
-
-        image_tensor = torch.from_numpy(image_input).to(device)
-
-        # ---------------- Mask ----------------
-        mask_raw = cv2.imread(y, cv2.IMREAD_GRAYSCALE)
-        mask_raw = cv2.resize(mask_raw, size, interpolation=cv2.INTER_NEAREST)
-
-        final_mask = np.zeros(mask_raw.shape, dtype=np.int64)
-        filename = os.path.basename(y).lower()
-
-        tumor_pixels = mask_raw > 127
-
-        if "benign" in filename:
-            final_mask[tumor_pixels] = 1
-        elif "malignant" in filename:
-            final_mask[tumor_pixels] = 2
-        else:
-            final_mask[tumor_pixels] = 0
-
-        save_mask_color = class_to_color(final_mask)
-
-        mask_tensor = torch.from_numpy(final_mask).long().unsqueeze(0).to(device)
-
-        with torch.no_grad():
-            start_time = time.time()
-
-            y_pred1, y_pred2 = model(image_tensor)
-
-            end_time = time.time() - start_time
-            time_taken.append(end_time)
-
-            y_pred1 = torch.softmax(y_pred1, dim=1)
-            y_pred2 = torch.softmax(y_pred2, dim=1)
-
-            y_pred1_classes = torch.argmax(y_pred1, dim=1)
-            y_pred2_classes = torch.argmax(y_pred2, dim=1)
-
-            mask_flat = mask_tensor.squeeze(0)
-
-            # Foreground-only (background excluded) headline, matching test_CBIS.
-            score_1 = calculate_foreground_metrics(mask_flat, y_pred1_classes)
-            score_2 = calculate_foreground_metrics(mask_flat, y_pred2_classes)
-
-            metrics_score_1 = list(map(add, metrics_score_1, score_1))
-            metrics_score_2 = list(map(add, metrics_score_2, score_2))
-
-            pred1_np = y_pred1_classes[0].cpu().numpy().astype(np.uint8)
-            pred2_np = y_pred2_classes[0].cpu().numpy().astype(np.uint8)
-
-            for class_id in [0, 1, 2]:
-                d = dice_per_class(pred2_np, final_mask, class_id)
-                j = iou_per_class(pred2_np, final_mask, class_id)
-
-                if not np.isnan(d):
-                    class_dice[class_id].append(d)
-                if not np.isnan(j):
-                    class_iou[class_id].append(j)
-
-            pred1_gray = class_to_gray(pred1_np)
-            pred2_gray = class_to_gray(pred2_np)
-
-            pred1_color = class_to_color(pred1_np)
-            pred2_color = class_to_color(pred2_np)
-
-        # ---------------- Overlay ----------------
-        overlay = cv2.addWeighted(save_img, 0.65, pred2_color, 0.35, 0)
-
-        # ---------------- Save outputs ----------------
-        line = np.ones((size[1], 10, 3), dtype=np.uint8) * 255
-
-        joint = np.concatenate(
-            [
-                save_img,
-                line,
-                save_mask_color,
-                line,
-                pred1_color,
-                line,
-                pred2_color,
-                line,
-                overlay,
-            ],
-            axis=1,
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    calibration_dataset = _dataset(config, "calibration")
+    candidates = []
+    for checkpoint_path in _candidate_paths(run_dir, args.checkpoint):
+        bundle = _collect(
+            checkpoint_path,
+            calibration_dataset,
+            config,
+            device,
+            args.batch_size,
+            args.num_workers,
         )
+        sweep = sweep_foreground_thresholds(
+            bundle["p2"],
+            bundle["targets"],
+            class_ids=bundle["class_ids"],
+            sample_ids=bundle["sample_ids"],
+        )
+        candidates.append(
+            {
+                "path": checkpoint_path,
+                "epoch": bundle["epoch"],
+                "threshold": float(sweep["threshold"]),
+                "metrics": sweep["best_metrics"],
+                "sweep": sweep["sweep"],
+            }
+        )
+    best_score = max(item["metrics"]["S_bal"] for item in candidates)
+    tied = [item for item in candidates if best_score - item["metrics"]["S_bal"] <= 1e-4]
+    selected = max(
+        tied,
+        key=lambda item: (
+            item["metrics"]["D_N"],
+            item["threshold"],
+            str(item["path"]),
+        ),
+    )
 
-        cv2.imwrite(f"{save_path}/joint/{name}", joint)
-        cv2.imwrite(f"{save_path}/mask1_gray/{name}", pred1_gray)
-        cv2.imwrite(f"{save_path}/mask2_gray/{name}", pred2_gray)
-        cv2.imwrite(f"{save_path}/mask1_color/{name}", pred1_color)
-        cv2.imwrite(f"{save_path}/mask2_color/{name}", pred2_color)
-        cv2.imwrite(f"{save_path}/overlays/{name}", overlay)
+    outer_dataset = _dataset(config, "outer")
+    outer_bundle = _collect(
+        selected["path"],
+        outer_dataset,
+        config,
+        device,
+        args.batch_size,
+        args.num_workers,
+    )
+    p1_metrics = evaluate_probabilities(
+        outer_bundle["p1"],
+        outer_bundle["targets"],
+        class_ids=outer_bundle["class_ids"],
+        sample_ids=outer_bundle["sample_ids"],
+        threshold=selected["threshold"],
+        compute_surface=True,
+    )
+    p2_metrics = evaluate_probabilities(
+        outer_bundle["p2"],
+        outer_bundle["targets"],
+        class_ids=outer_bundle["class_ids"],
+        sample_ids=outer_bundle["sample_ids"],
+        threshold=selected["threshold"],
+        compute_surface=True,
+    )
 
-    print("\n--- Output 1 Scores ---")
-    print_score(metrics_score_1, len(test_x))
-
-    print("\n--- Output 2 Scores Final Output ---")
-    print_score(metrics_score_2, len(test_x))
-
-    print("\n--- Per-Class Final Output Scores ---")
-
-    class_names = {
-        0: "Background",
-        1: "Benign lesion",
-        2: "Malignant lesion",
+    probability_path = run_dir / "test_probabilities.npz"
+    probability_temporary = run_dir / ".test_probabilities.npz.tmp"
+    outer_split_hash = split_membership_hash(outer_dataset.rows)
+    checkpoint_hash = sha256_file(selected["path"])
+    with probability_temporary.open("wb") as handle:
+        np.savez_compressed(
+            handle,
+            p1=outer_bundle["p1"],
+            p2=outer_bundle["p2"],
+            targets=outer_bundle["targets"],
+            class_ids=outer_bundle["class_ids"],
+            sample_ids=outer_bundle["sample_ids"],
+            lesion_quartiles=outer_bundle["lesion_quartiles"],
+            dataset_fingerprint=np.asarray(dataset_metadata["dataset_fingerprint"]),
+            manifest_sha256=np.asarray(sha256_file(manifest)),
+            outer_split_hash=np.asarray(outer_split_hash),
+            checkpoint_sha256=np.asarray(checkpoint_hash),
+            threshold=np.asarray(selected["threshold"], dtype=np.float64),
+        )
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(probability_temporary, probability_path)
+    probability_hash = sha256_file(probability_path)
+    model, selected_checkpoint = _load_model(selected["path"], config, device)
+    write_deploy_checkpoint(
+        run_dir,
+        model,
+        config,
+        threshold=selected["threshold"],
+        source_checkpoint=selected["path"],
+        source_epoch=int(selected_checkpoint.get("epoch", selected["epoch"])),
+    )
+    selected_relative = selected["path"].relative_to(run_dir).as_posix()
+    per_image_path = run_dir / "test_per_image.json"
+    atomic_json_dump(
+        {
+            "threshold": float(selected["threshold"]),
+            "p1": _per_image_rows(outer_bundle, selected["threshold"], "p1"),
+            "p2": _per_image_rows(outer_bundle, selected["threshold"], "p2"),
+        },
+        per_image_path,
+    )
+    report = {
+        "checkpoint": selected_relative,
+        "checkpoint_sha256": checkpoint_hash,
+        "checkpoint_epoch": selected["epoch"],
+        "threshold": selected["threshold"],
+        "dataset_fingerprint": dataset_metadata["dataset_fingerprint"],
+        "manifest_sha256": sha256_file(manifest),
+        "outer_split_hash": outer_split_hash,
+        "calibration": selected["metrics"],
+        "test_p1": p1_metrics,
+        "test_p2": p2_metrics,
+        "lesion_size_quartiles_p1": _quartile_metrics(
+            outer_bundle, selected["threshold"], "p1"
+        ),
+        "lesion_size_quartiles_p2": _quartile_metrics(
+            outer_bundle, selected["threshold"], "p2"
+        ),
+        "per_image_metrics": per_image_path.name,
+        "probabilities": probability_path.name,
+        "probabilities_sha256": probability_hash,
     }
-
-    for class_id, class_name in class_names.items():
-        mean_dice = np.mean(class_dice[class_id]) if class_dice[class_id] else 0.0
-        mean_iou = np.mean(class_iou[class_id]) if class_iou[class_id] else 0.0
-
-        print(f"{class_name}: Dice = {mean_dice:.4f}, IoU = {mean_iou:.4f}")
-
-    mean_time_taken = np.mean(time_taken)
-    mean_fps = 1 / mean_time_taken
-
-    print(f"\nMean FPS: {mean_fps:.2f}")
-    print(f"Results saved at: {save_path}")
+    atomic_json_dump(report, run_dir / "test_results.json")
+    summary_path = run_dir / "run_summary.json"
+    summary = load_json(summary_path) if summary_path.is_file() else {}
+    summary.update(
+        {
+            "deployment_epoch": int(selected["epoch"]),
+            "selected_checkpoint": selected_relative,
+            "locked_threshold": float(selected["threshold"]),
+            "test_report": "test_results.json",
+            "deploy_checkpoint": "deploy.pt",
+        }
+    )
+    atomic_json_dump(summary, summary_path)
+    print(
+        f"Test S_bal={p2_metrics['S_bal']:.4f} "
+        f"Dice benign={p2_metrics['D_B_bin']:.4f} "
+        f"malignant={p2_metrics['D_M_bin']:.4f} "
+        f"threshold={selected['threshold']:.2f}"
+    )
+    print(f"Report: {run_dir / 'test_results.json'}")
 
 
 if __name__ == "__main__":
-    seeding(42)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] Device: {device}")
-
-    model = build_doubleunet()
-    model = model.to(device)
-
-    # Print parameter count before loading checkpoint
-    print_model_parameters(model)
-
-    checkpoint_path = "files/BUSI_checkpoint.pth"
-
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        model.load_state_dict(checkpoint["model_state_dict"])
-    else:
-        model.load_state_dict(checkpoint)
-
-    model.eval()
-
-    path = "dataset_seg_BUSI"
-    (train_x, train_y), (valid_x, valid_y), (test_x, test_y) = load_data(path)
-
-    print(f"Train images: {len(train_x)}")
-    print(f"Val images  : {len(valid_x)}")
-    print(f"Test images : {len(test_x)}")
-    print(f"Test masks  : {len(test_y)}")
-
-    save_path = "results_BUSI"
-
-    for item in [
-        "mask1_gray",
-        "mask2_gray",
-        "mask1_color",
-        "mask2_color",
-        "overlays",
-        "joint",
-    ]:
-        create_dir(f"{save_path}/{item}")
-
-    size = (256, 256)
-
-    evaluate(model, save_path, test_x, test_y, size, device)
+    main()

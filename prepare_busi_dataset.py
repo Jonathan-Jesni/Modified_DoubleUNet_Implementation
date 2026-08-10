@@ -1,152 +1,99 @@
+"""Build the immutable, content-grouped BUSI v2 dataset."""
+
+from __future__ import annotations
+
+import argparse
 from pathlib import Path
-import shutil
-import cv2
-import numpy as np
-from sklearn.model_selection import train_test_split
+
+from busi_dataset import GenerationConfig, generate_busi_dataset
 
 
 ROOT = Path(__file__).resolve().parent
-BUSI_ROOT = ROOT / "BUSI_dataset"
-OUT_ROOT = ROOT / "dataset_seg_BUSI"
-
-CLASSES_TO_USE = ["benign", "malignant"]   # add "normal" later if needed
-RANDOM_STATE = 42
 
 
-def ensure_dir(path: Path):
-    path.mkdir(parents=True, exist_ok=True)
+def resolve_review_csv(review_csv: Path | None, prior_manifest: Path | None) -> Path | None:
+    if review_csv is not None:
+        return review_csv
+    if prior_manifest is None:
+        return None
+    embedded = prior_manifest.parent / "review" / "completed_two_reviewer_review.csv"
+    return embedded if embedded.is_file() else None
 
 
-def is_base_image(path: Path) -> bool:
-    name = path.stem.lower()
-    return "_mask" not in name
-
-
-def collect_mask_paths(class_dir: Path, image_path: Path):
-    """
-    For image 'benign (100).png', collect:
-      benign (100)_mask.png
-      benign (100)_mask_1.png
-      benign (100)_mask_2.png
-      ...
-    """
-    base = image_path.stem
-    mask_paths = sorted(class_dir.glob(f"{base}_mask*.png"))
-    return mask_paths
-
-
-def merge_masks(mask_paths, target_shape=None):
-    merged = None
-
-    for mp in mask_paths:
-        m = cv2.imread(str(mp), cv2.IMREAD_GRAYSCALE)
-        if m is None:
-            continue
-
-        m = (m > 0).astype(np.uint8) * 255
-
-        if merged is None:
-            merged = np.zeros_like(m, dtype=np.uint8)
-
-        merged = np.maximum(merged, m)
-
-    if merged is None and target_shape is not None:
-        merged = np.zeros(target_shape, dtype=np.uint8)
-
-    return merged
-
-
-def gather_samples():
-    samples = []
-
-    for cls in CLASSES_TO_USE:
-        class_dir = BUSI_ROOT / cls
-        if not class_dir.exists():
-            print(f"[WARN] Missing class folder: {class_dir}")
-            continue
-
-        image_files = sorted([p for p in class_dir.glob("*.png") if is_base_image(p)])
-
-        for image_path in image_files:
-            mask_paths = collect_mask_paths(class_dir, image_path)
-
-            # Skip samples with no mask for now
-            if len(mask_paths) == 0:
-                continue
-
-            samples.append({
-                "class_name": cls,
-                "image_path": image_path,
-                "mask_paths": mask_paths,
-            })
-
-    return samples
-
-
-def save_split(split_name, samples):
-    out_img_dir = OUT_ROOT / split_name / "images"
-    out_mask_dir = OUT_ROOT / split_name / "masks"
-    ensure_dir(out_img_dir)
-    ensure_dir(out_mask_dir)
-
-    for idx, sample in enumerate(samples):
-        image_path = sample["image_path"]
-        mask_paths = sample["mask_paths"]
-        cls = sample["class_name"]
-
-        img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            print(f"[WARN] Could not read image: {image_path}")
-            continue
-
-        merged_mask = merge_masks(mask_paths, target_shape=img.shape[:2])
-        if merged_mask is None:
-            print(f"[WARN] Could not build mask for: {image_path}")
-            continue
-
-        file_name = f"{cls}_{idx:04d}.png"
-        cv2.imwrite(str(out_img_dir / file_name), img)
-        cv2.imwrite(str(out_mask_dir / file_name), merged_mask)
-
-
-def main():
-    ensure_dir(OUT_ROOT)
-
-    samples = gather_samples()
-    print(f"Total usable samples: {len(samples)}")
-
-    # 80 / 10 / 10 split, stratified by the source benign/malignant class.
-    labels = [sample["class_name"] for sample in samples]
-    train_samples, temp_samples = train_test_split(
-        samples,
-        test_size=0.20,
-        random_state=RANDOM_STATE,
-        shuffle=True,
-        stratify=labels,
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Generate a non-destructive, content-grouped BUSI v2 dataset."
     )
-    temp_labels = [sample["class_name"] for sample in temp_samples]
-    val_samples, test_samples = train_test_split(
-        temp_samples,
-        test_size=0.50,
-        random_state=RANDOM_STATE,
-        shuffle=True,
-        stratify=temp_labels,
+    parser.add_argument("--raw-root", type=Path, default=ROOT / "BUSI_dataset")
+    parser.add_argument(
+        "--output-root", type=Path, default=ROOT / "dataset_seg_BUSI_v2"
     )
+    parser.add_argument(
+        "--prior-dataset-root",
+        type=Path,
+        default=ROOT / "dataset_seg_BUSI",
+        help="Existing prepared dataset used only to recover prior split membership.",
+    )
+    parser.add_argument(
+        "--prior-manifest",
+        type=Path,
+        default=ROOT / "dataset_seg_BUSI_v2" / "manifest.csv",
+        help=(
+            "Canonical manifest used to recover historical split membership. "
+            "It takes precedence over --prior-dataset-root when present."
+        ),
+    )
+    parser.add_argument(
+        "--include-normal",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include normal all-background examples (default: true).",
+    )
+    parser.add_argument("--split-seed", type=int, default=20260717)
+    parser.add_argument("--sealed-fraction", type=float, default=0.15)
+    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument("--calibration-fraction", type=float, default=0.125)
+    parser.add_argument(
+        "--expected-prior-test-count",
+        type=int,
+        default=65,
+        help="Fail unless exactly this many previously inspected test images are recovered.",
+    )
+    parser.add_argument(
+        "--review-csv",
+        type=Path,
+        default=None,
+        help=(
+            "Optional completed two-reviewer near-duplicate CSV. Pending or "
+            "disputed pairs remain conservatively grouped."
+        ),
+    )
+    return parser
 
-    for split_name, split_samples in (
-        ("Train", train_samples),
-        ("Val", val_samples),
-        ("Test", test_samples),
-    ):
-        benign = sum(sample["class_name"] == "benign" for sample in split_samples)
-        malignant = sum(sample["class_name"] == "malignant" for sample in split_samples)
-        print(f"{split_name}: {len(split_samples)} (benign={benign}, malignant={malignant})")
 
-    save_split("train", train_samples)
-    save_split("val", val_samples)
-    save_split("test", test_samples)
-
-    print(f"\nFinished. Output at: {OUT_ROOT.resolve()}")
+def main() -> None:
+    args = build_parser().parse_args()
+    review_csv = resolve_review_csv(args.review_csv, args.prior_manifest)
+    summary = generate_busi_dataset(GenerationConfig(
+        raw_root=args.raw_root,
+        output_root=args.output_root,
+        prior_dataset_root=args.prior_dataset_root,
+        prior_manifest=args.prior_manifest,
+        include_normal=args.include_normal,
+        split_seed=args.split_seed,
+        sealed_fraction=args.sealed_fraction,
+        folds=args.folds,
+        calibration_fraction=args.calibration_fraction,
+        expected_prior_test_count=args.expected_prior_test_count,
+        review_csv=review_csv,
+    ))
+    print(f"Generated BUSI v2 at: {args.output_root.resolve()}")
+    print(f"Eligible samples: {summary['eligible_samples']}")
+    print(f"Development: {summary['development_samples']}")
+    print(f"Sealed: {summary['sealed_samples']}")
+    print(f"Quarantined/excluded: {summary['excluded_samples']}")
+    print(f"Near-duplicate candidates: {summary['near_duplicate_candidates']}")
+    print(f"Dataset fingerprint: {summary['dataset_fingerprint']}")
 
 
 if __name__ == "__main__":
