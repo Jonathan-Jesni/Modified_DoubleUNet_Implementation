@@ -497,6 +497,26 @@ class BUSIMetricAccumulator:
         )
         balanced_score = _balanced_mean(d_binary_balanced, d_class_balanced)
 
+        # Continuous companion to D_N, and to S_bal through it. D_N is an
+        # all-or-nothing per-image boolean measured over ~12 normal calibration
+        # images, so it can only take 13 distinct values; that gives S_bal a
+        # quantization step of roughly 0.014 against a minimum_improvement of
+        # 0.002, which makes plateau, early-stopping and checkpoint decisions
+        # substantially noise-driven. The soft form replaces "was the prediction
+        # completely empty" with "how much was predicted", so a near-miss ranks
+        # above a bad miss instead of both scoring zero. S_bal stays the reported
+        # headline; S_bal_soft is available for selection.
+        d_normal_soft = _stable_mean(
+            1.0 - float(record["normal_foreground_fraction"])
+            for record in normal_records
+        )
+        d_binary_balanced_soft = _balanced_mean(
+            d_normal_soft, d_benign_binary, d_malignant_binary
+        )
+        balanced_score_soft = _balanced_mean(
+            d_binary_balanced_soft, d_class_balanced
+        )
+
         confusion = np.zeros((3, 3), dtype=np.int64)
         for record in records:
             confusion += record["confusion"]
@@ -575,6 +595,9 @@ class BUSIMetricAccumulator:
             "D_bin_bal": d_binary_balanced,
             "D_cls_bal": d_class_balanced,
             "S_bal": balanced_score,
+            "D_N_soft": d_normal_soft,
+            "D_bin_bal_soft": d_binary_balanced_soft,
+            "S_bal_soft": balanced_score_soft,
             "binary_dice_macro_positive": _stable_mean(
                 record["binary_dice"] for record in positive_records
             ),
@@ -771,12 +794,18 @@ def sweep_foreground_thresholds(
     sample_ids=None,
     compute_surface=False,
     ece_bins=15,
+    metric="S_bal",
 ):
     """Select a validation threshold with the locked BUSI v2 tie rules.
 
-    S_bal is maximized. Scores within tie_tolerance are resolved by higher D_N,
-    then by the higher threshold.
+    The selection metric (S_bal by default, S_bal_soft optionally) is maximized.
+    Scores within tie_tolerance are resolved by the matching specificity term,
+    then by the higher threshold. S_bal is always reported either way.
     """
+
+    if metric not in {"S_bal", "S_bal_soft"}:
+        raise ValueError(f"Unsupported selection metric {metric!r}")
+    tie_key = "D_N_soft" if metric == "S_bal_soft" else "D_N"
 
     probability_array, _ = _as_batched_probabilities(probabilities)
     target_array = _as_batched_labels(targets, "targets")
@@ -808,7 +837,7 @@ def sweep_foreground_thresholds(
             sample_ids=sample_ids,
             compute_surface=False,
         )
-        score = selection_metrics["S_bal"]
+        score = selection_metrics[metric]
         if score is None:
             raise ValueError(
                 "threshold calibration requires normal, benign, and malignant samples"
@@ -816,6 +845,8 @@ def sweep_foreground_thresholds(
         row = {
             "threshold": threshold,
             "D_N": selection_metrics["D_N"],
+            "D_N_soft": selection_metrics["D_N_soft"],
+            "S_bal_soft": selection_metrics["S_bal_soft"],
             "D_B_bin": selection_metrics["D_B_bin"],
             "D_M_bin": selection_metrics["D_M_bin"],
             "D_B_cls": selection_metrics["D_B_cls"],
@@ -826,13 +857,13 @@ def sweep_foreground_thresholds(
         }
         sweep_rows.append(row)
 
-    maximum_score = max(row["S_bal"] for row in sweep_rows)
+    maximum_score = max(row[metric] for row in sweep_rows)
     tied = [
         row
         for row in sweep_rows
-        if maximum_score - row["S_bal"] <= tie_tolerance
+        if maximum_score - row[metric] <= tie_tolerance
     ]
-    best = max(tied, key=lambda row: (row["D_N"], row["threshold"]))
+    best = max(tied, key=lambda row: (row[tie_key], row["threshold"]))
 
     best_metrics = evaluate_probabilities(
         probabilities=probability_array,

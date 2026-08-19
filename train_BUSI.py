@@ -16,9 +16,14 @@ from typing import Any, Mapping
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
-from BUSI_model import build_doubleunet, configure_screening_architecture
+from BUSI_model import (
+    WeightEMA,
+    build_doubleunet,
+    configure_screening_architecture,
+    predict_probabilities,
+)
 from busi_evaluation import BUSIMetricAccumulator
 from busi_runtime import (
     CLASS_MAPPING,
@@ -98,18 +103,24 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "task_lr": 1e-4,
         "backbone_lr": 1e-5,
         "xception_lr": 1e-6,
-        "task_weight_decay": 1e-4,
+        "task_weight_decay": 1e-5,
         "backbone_weight_decay": 1e-5,
-        "phase_boundaries": [5, 25],
+        "phase_boundaries": [2, 8],
+        "scheduler": "plateau",
         "scheduler_factor": 0.5,
         "scheduler_patience": 6,
+        "warmup_epochs": 0,
+        "ema_decay": None,
         "minimum_lr": 1e-7,
+        "train_probe_size": 96,
         "equal_optimizer_steps": None,
         "all_development": False,
     },
     "evaluation": {
         "checkpoint_threshold": 0.50,
         "compute_surface_during_training": False,
+        "tta": False,
+        "selection_metric": "S_bal",
     },
     "metadata": {
         "study_stage": "simple",
@@ -173,6 +184,27 @@ def _metadata_values(metadata: Mapping[str, Any], key: str) -> list[Any]:
     return [value]
 
 
+def train_probe_indices(rows, size: int, seed: int) -> list[int]:
+    """Deterministic class-stratified subsample of the fit pool.
+
+    Held fixed across epochs so the train-side curve is comparable epoch to epoch,
+    and stratified so its S_bal is computed over the same three diagnoses as the
+    calibration score it is differenced against.
+    """
+
+    by_class: dict[int, list[int]] = {}
+    for index, row in enumerate(rows):
+        by_class.setdefault(int(row["class_id"]), []).append(index)
+    total = len(rows)
+    rng = np.random.default_rng(seed)
+    chosen: list[int] = []
+    for class_id in sorted(by_class):
+        pool = by_class[class_id]
+        take = min(len(pool), max(1, round(size * len(pool) / total)))
+        chosen.extend(int(value) for value in rng.choice(pool, size=take, replace=False))
+    return sorted(chosen)
+
+
 def make_loaders(config: Mapping[str, Any], generator: torch.Generator):
     dataset_config = config["dataset"]
     training = config["training"]
@@ -233,7 +265,39 @@ def make_loaders(config: Mapping[str, Any], generator: torch.Generator):
         if calibration_dataset is not None
         else None
     )
-    return train_dataset, calibration_dataset, train_loader, calibration_loader
+
+    # Train-side probe: the same fit images, unaugmented and in eval mode, scored
+    # with the same accumulator as calibration. Without this the log carries train
+    # LOSS against validation S_bal, which cannot be differenced, so the
+    # overfit/underfit gap is unreadable - the reason "no overfitting" has not been
+    # a checkable claim on this pipeline.
+    probe_loader = None
+    probe_size = int(training.get("train_probe_size", 96))
+    if probe_size > 0:
+        probe_dataset = ManifestSegmentationDataset(
+            manifest,
+            split=fit_split,
+            outer_fold=fit_fold,
+            preprocessing_profile=dataset_config["preprocessing_profile"],
+            input_size=dataset_config["input_size"],
+            augmentation=None,
+        )
+        indices = train_probe_indices(
+            probe_dataset.rows, probe_size, int(config["seed"])
+        )
+        probe_loader = DataLoader(
+            Subset(probe_dataset, indices),
+            shuffle=False,
+            drop_last=False,
+            **common,
+        )
+    return (
+        train_dataset,
+        calibration_dataset,
+        train_loader,
+        calibration_loader,
+        probe_loader,
+    )
 
 
 def phase_for_epoch(epoch: int, boundaries: list[int]) -> int:
@@ -269,14 +333,46 @@ def make_optimizer(model, config: Mapping[str, Any], prior=None):
 
 
 def make_scheduler(optimizer, config: Mapping[str, Any]):
+    """Plateau (metric-driven) or cosine (schedule-driven) LR decay.
+
+    Cosine exists because the plateau scheduler steps on S_bal, whose D_N term is
+    a boolean over ~12 normal calibration images. That gives the score a ~0.014
+    quantization step, so "is this a plateau?" is answered partly by noise. Cosine
+    never consults the metric.
+    """
+
     training = config["training"]
-    return torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=float(training["scheduler_factor"]),
-        patience=int(training["scheduler_patience"]),
-        min_lr=float(training["minimum_lr"]),
-    )
+    kind = str(training.get("scheduler", "plateau"))
+    if kind == "plateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=float(training["scheduler_factor"]),
+            patience=int(training["scheduler_patience"]),
+            min_lr=float(training["minimum_lr"]),
+        )
+    if kind == "cosine":
+        warmup = max(0, int(training.get("warmup_epochs", 0)))
+        total = max(1, int(training["max_epochs"]))
+        floor = float(training["minimum_lr"])
+        peaks = [group["lr"] for group in optimizer.param_groups]
+
+        # LambdaLR multiplies each group's own initial_lr by this factor, so the
+        # factor must be group-independent for discriminative LRs to keep their
+        # ratio. The floor is expressed as a fraction of the largest group's peak
+        # so no group decays to exactly zero.
+        minimum_factor = floor / max(peaks) if peaks and max(peaks) > 0 else 0.0
+
+        def factor(epoch_index):
+            if warmup and epoch_index < warmup:
+                return (epoch_index + 1) / (warmup + 1)
+            span = max(1, total - warmup)
+            progress = min(1.0, max(0.0, (epoch_index - warmup) / span))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return minimum_factor + (1.0 - minimum_factor) * cosine
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=factor)
+    raise ValueError(f"Unsupported scheduler {kind!r}; expected 'plateau' or 'cosine'")
 
 
 def make_loss(config: Mapping[str, Any], fit_dataset):
@@ -332,7 +428,7 @@ def training_state_diagnostics(model) -> dict[str, Any]:
     }
 
 
-def run_epoch(model, loader, loss_fn, optimizer, scaler, device, config):
+def run_epoch(model, loader, loss_fn, optimizer, scaler, device, config, ema=None):
     model.train()
     amp = bool(config["training"]["amp"] and device.type == "cuda")
     clip_limit = float(config["training"]["gradient_clip_norm"])
@@ -354,6 +450,8 @@ def run_epoch(model, loader, loss_fn, optimizer, scaler, device, config):
             raise FloatingPointError("Non-finite gradient norm")
         scaler.step(optimizer)
         scaler.update()
+        if ema is not None:
+            ema.update(model)
         totals["loss"] += float(loss.detach())
         totals["preclip_grad_norm"] += float(grad_norm)
         totals["clipped_steps"] += int(float(grad_norm) > clip_limit)
@@ -369,7 +467,7 @@ def run_epoch(model, loader, loss_fn, optimizer, scaler, device, config):
 
 
 @torch.inference_mode()
-def evaluate_loader(model, loader, device, threshold=0.5, compute_surface=False):
+def evaluate_loader(model, loader, device, threshold=0.5, compute_surface=False, tta=False):
     model.eval()
     accumulators = [
         BUSIMetricAccumulator(threshold=threshold, compute_surface=compute_surface),
@@ -377,12 +475,12 @@ def evaluate_loader(model, loader, device, threshold=0.5, compute_surface=False)
     ]
     for images, masks, metadata in loader:
         images = images.to(device, non_blocking=True)
-        p1, p2 = model(images)
+        p1, p2 = predict_probabilities(model, images, tta=tta)
         class_ids = _metadata_values(metadata, "class_id")
         sample_ids = _metadata_values(metadata, "sample_id")
         targets = masks.numpy()
-        for accumulator, logits in zip(accumulators, (p1, p2)):
-            probabilities = torch.softmax(logits.float(), dim=1).cpu().numpy()
+        for accumulator, head in zip(accumulators, (p1, p2)):
+            probabilities = head.cpu().numpy()
             accumulator.update(
                 targets,
                 probabilities=probabilities,
@@ -726,7 +824,13 @@ def main() -> None:
     seed_everything(config["seed"], config["training"]["deterministic"])
     generator = torch.Generator().manual_seed(config["seed"])
 
-    train_dataset, calibration_dataset, train_loader, calibration_loader = make_loaders(config, generator)
+    (
+        train_dataset,
+        calibration_dataset,
+        train_loader,
+        calibration_loader,
+        probe_loader,
+    ) = make_loaders(config, generator)
     device = torch.device("cuda")
     use_amp = bool(config["training"]["amp"] and device.type == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -762,6 +866,8 @@ def main() -> None:
         initial_phase = 3
     model.set_training_phase(initial_phase)
     model.to(device)
+    ema_decay = config["training"].get("ema_decay")
+    ema = WeightEMA(model, decay=float(ema_decay)) if ema_decay else None
     loss_fn, pixel_counts, class_weights = make_loss(config, train_dataset)
     loss_fn.to(device)
     print(
@@ -905,7 +1011,7 @@ def main() -> None:
             torch.cuda.reset_peak_memory_stats(device)
         start = time.perf_counter()
         train_metrics = run_epoch(
-            model, train_loader, loss_fn, optimizer, scaler, device, config
+            model, train_loader, loss_fn, optimizer, scaler, device, config, ema=ema
         )
         global_step += int(train_metrics["optimizer_steps"])
         post_train_state = training_state_diagnostics(model)
@@ -914,6 +1020,9 @@ def main() -> None:
         score = None
         is_best = False
         enters_top_three = False
+        selection_metric = str(config["evaluation"].get("selection_metric", "S_bal"))
+        use_tta = bool(config["evaluation"].get("tta", False))
+        ema_validation = None
         if calibration_loader is not None:
             validation = evaluate_loader(
                 model,
@@ -923,9 +1032,36 @@ def main() -> None:
                 compute_surface=bool(
                     config["evaluation"]["compute_surface_during_training"]
                 ),
+                tta=use_tta,
             )
-            score = float(validation["p2"]["S_bal"])
-            scheduler.step(score)
+            if ema is not None:
+                # Score the averaged weights alongside the raw ones so a single
+                # screening run answers whether EMA helps, then restore.
+                live_state = {
+                    name: value.detach().clone()
+                    for name, value in model.state_dict().items()
+                }
+                ema.copy_to(model)
+                ema_validation = evaluate_loader(
+                    model,
+                    calibration_loader,
+                    device,
+                    threshold=float(config["evaluation"]["checkpoint_threshold"]),
+                    compute_surface=False,
+                    tta=use_tta,
+                )
+                model.load_state_dict(live_state, strict=True)
+            selected = validation["p2"].get(selection_metric)
+            if selected is None:
+                raise RuntimeError(
+                    f"selection_metric {selection_metric!r} is unavailable on this "
+                    "calibration split"
+                )
+            score = float(selected)
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(score)
+            else:
+                scheduler.step()
             is_best = score > best_score
             if is_best:
                 best_score = score
@@ -937,6 +1073,47 @@ def main() -> None:
                 early = {"bad_epochs": 0, "best_early_stop_score": score}
             else:
                 early["bad_epochs"] += 1
+
+        # Same metric, same accumulator, unaugmented fit images: the difference is
+        # the fit-regime signal. A large positive gap with a flat validation curve
+        # is overfitting; a gap near zero with a low validation score is
+        # underfitting. Prior runs on the old pipeline sat at 0.28-0.38 gap
+        # unregularized and 0.11-0.16 over-regularized, with validation worse in
+        # the second case - so read both numbers, never the gap alone.
+        train_probe = None
+        fit_regime = None
+        if probe_loader is not None:
+            train_probe = evaluate_loader(
+                model,
+                probe_loader,
+                device,
+                threshold=float(config["evaluation"]["checkpoint_threshold"]),
+                compute_surface=False,
+            )
+            train_score = train_probe["p2"]["S_bal"]
+            fit_regime = {
+                "train_S_bal": train_score,
+                "validation_S_bal": score,
+                "S_bal_gap": (
+                    float(train_score) - float(score)
+                    if train_score is not None and score is not None
+                    else None
+                ),
+                "train_D_bin_bal": train_probe["p2"]["D_bin_bal"],
+                "validation_D_bin_bal": (
+                    validation["p2"]["D_bin_bal"] if validation is not None else None
+                ),
+                # Comparable in spirit to the historical "val fg F1" numbers, which
+                # S_bal is not: S_bal folds in a normal-image specificity term the
+                # old benign/malignant-only pipeline had no equivalent for.
+                "train_fg_dice": train_probe["p2"]["binary_dice_macro_positive"],
+                "validation_fg_dice": (
+                    validation["p2"]["binary_dice_macro_positive"]
+                    if validation is not None
+                    else None
+                ),
+                "probe_sample_count": train_probe["p2"]["sample_count"],
+            }
 
         elapsed = time.perf_counter() - start
         resources = {
@@ -960,6 +1137,10 @@ def main() -> None:
             "elapsed_seconds": elapsed,
             "train": train_metrics,
             "calibration_fixed_0_50": validation,
+            "train_probe": train_probe,
+            "ema_calibration": ema_validation,
+            "fit_regime": fit_regime,
+            "selection_metric": selection_metric,
             "training_state": post_train_state,
             "resources": resources,
             "learning_rates": {
@@ -999,9 +1180,15 @@ def main() -> None:
         atomic_torch_save(payload, run_dir / "last.pt")
         append_jsonl(run_dir / "training.jsonl", epoch_row)
         score_text = f" | S_bal={score:.4f}" if score is not None else ""
+        gap_text = ""
+        if fit_regime is not None and fit_regime["S_bal_gap"] is not None:
+            gap_text = (
+                f" | train={fit_regime['train_S_bal']:.4f}"
+                f" gap={fit_regime['S_bal_gap']:+.4f}"
+            )
         print(
             f"Epoch {epoch:03d}/{max_epochs} | phase={phase} | "
-            f"loss={train_metrics['loss']:.4f}{score_text} | "
+            f"loss={train_metrics['loss']:.4f}{score_text}{gap_text} | "
             f"time={elapsed:.1f}s",
             flush=True,
         )
