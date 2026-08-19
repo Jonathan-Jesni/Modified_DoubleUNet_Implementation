@@ -22,7 +22,7 @@ from utils import (
     calculate_foreground_metrics,
 )
 from CBIS_model import build_doubleunet
-from metrics import CombinedLoss, CBIS_CLASS_WEIGHTS
+from metrics import BUSIStageLoss, DeepSupervisionLoss, compute_dynamic_class_weights
 
 
 DEBUG_VIS_DIR = "files/debug_train_visuals"
@@ -31,6 +31,28 @@ SAVE_DEBUG_EVERY_N_SAMPLES = 100
 NUM_CLASSES = 3
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)[:, None, None]
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)[:, None, None]
+
+# Tempering exponent for median-frequency class weighting; matches BUSI. Pure
+# median-frequency balancing (power=1.0) drove background's weight to ~0.002 on
+# CBIS and over-segmented badly. Lower powers keep more background signal.
+CLASS_WEIGHT_POWER = 0.65
+
+
+def count_mask_class_pixels(mask_paths, size):
+    """Per-class pixel counts over the masks at the resolution training consumes."""
+    counts = np.zeros(NUM_CLASSES, dtype=np.int64)
+    for mask_path in mask_paths:
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise ValueError(f"Failed to read mask: {mask_path}")
+        mask = cv2.resize(mask, size, interpolation=cv2.INTER_NEAREST)
+        mask = np.clip(mask, 0, NUM_CLASSES - 1).astype(np.uint8)
+        counts += np.bincount(mask.reshape(-1), minlength=NUM_CLASSES)[:NUM_CLASSES]
+    if np.any(counts <= 0):
+        raise ValueError(
+            f"Every class must appear in the training masks; got {counts.tolist()}"
+        )
+    return [int(value) for value in counts]
 
 
 def colorize_mask(mask):
@@ -156,27 +178,20 @@ class DATASET(Dataset):
         return self.n_samples
 
 
-def train(model, loader, optimizer, loss_fn, device, scaler, frozen_backbone_modules=None):
+def train(model, loader, optimizer, loss_fn, device, scaler):
+    # StagedFineTuningMixin.train() re-applies the BatchNorm policy on every call,
+    # so backbone running statistics stay pinned without a separate module list.
+    # requires_grad=False alone would not do this: it stops weight updates but not
+    # running_mean/running_var recalculation off small, noisy batches.
     model.train()
-
-    # Keep the frozen backbone submodules pinned in eval mode for BatchNorm
-    # purposes, even though model.train() (above) just recursively set
-    # everything - including them - back to train mode. requires_grad=False
-    # only stops weight *gradient* updates; it does NOT stop BatchNorm's
-    # running_mean/running_var from being recalculated off live batch
-    # statistics every epoch. Left unpinned, the "frozen" backbones drift away
-    # from their pretrained calibration using small, noisy batch statistics
-    # that the (frozen) conv weights can never adapt to compensate for. This
-    # must be re-applied every epoch since train() is called once per epoch.
-    if frozen_backbone_modules:
-        for module in frozen_backbone_modules:
-            module.eval()
 
     epoch_loss = 0.0
     metrics_bg = [0.0, 0.0, 0.0, 0.0]   # background-inclusive (logging only)
     metrics_fg = [0.0, 0.0, 0.0, 0.0]   # foreground-only (drives checkpoint/early-stop)
 
-    # Use provided AMP Scaler
+    # Derived here rather than read from a module global defined in __main__, so
+    # train() stays importable and testable on its own.
+    use_cuda_amp = device.type == "cuda"
 
     for x, y in loader:
         x = x.to(device, dtype=torch.float32)
@@ -186,7 +201,7 @@ def train(model, loader, optimizer, loss_fn, device, scaler, frozen_backbone_mod
 
         with torch.amp.autocast("cuda", enabled=use_cuda_amp):
             p1, p2 = model(x)
-            loss = 0.4 * loss_fn(p1, y) + 1.0 * loss_fn(p2, y)
+            loss = loss_fn(p1, p2, y)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -226,7 +241,7 @@ def evaluate(model, loader, loss_fn, device):
 
             with torch.amp.autocast("cuda", enabled=use_cuda_amp):
                 p1, p2 = model(x)
-                loss = 0.4 * loss_fn(p1, y) + 1.0 * loss_fn(p2, y)
+                loss = loss_fn(p1, p2, y)
 
             epoch_loss += loss.item()
 
@@ -282,24 +297,14 @@ if __name__ == "__main__":
     data_str = f"Dataset Size:\nTrain: {len(train_x)} - Valid: {len(valid_x)} - Test: {len(test_x)}\n"
     print_and_save(train_log_path, data_str)
 
-    # CoarseDropout's kwargs changed in albumentations >=1.4 (range tuples) vs the
-    # older scalar API (<1.4). Build it compatibly so the same script runs on both
-    # the local venv (1.3.x) and the cloud env (2.x).
-    try:
-        coarse_dropout = A.CoarseDropout(
-            num_holes_range=(1, 6),
-            hole_height_range=(1, 20),
-            hole_width_range=(1, 20),
-            p=0.15,
-        )
-    except TypeError:
-        coarse_dropout = A.CoarseDropout(
-            min_holes=1, max_holes=6,
-            min_height=1, max_height=20,
-            min_width=1, max_width=20,
-            p=0.15,
-        )
-
+    # CoarseDropout was removed deliberately: it erases image pixels WITHOUT
+    # erasing the corresponding mask, so the model was being trained to predict
+    # lesion where the lesion had been cut out. On a 391-image training set that
+    # label noise is material.
+    #
+    # ElasticTransform and GridDistortion were also removed. Both warp lesion
+    # boundaries, which is exactly what Dice measures, and both were part of the
+    # augmentation bundle that regressed BUSI from ~0.43 to 0.3803.
     try:
         gauss_noise = A.GaussNoise(std_range=(0.012, 0.028), p=0.3)
     except TypeError:
@@ -310,14 +315,10 @@ if __name__ == "__main__":
         A.VerticalFlip(p=0.3),
         A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.15, rotate_limit=25,
                            border_mode=cv2.BORDER_REFLECT_101, p=0.5),
-        A.ElasticTransform(alpha=120, sigma=120*0.05,
-                           border_mode=cv2.BORDER_REFLECT_101, p=0.2),
-        A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.2),
         A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.4),
         gauss_noise,
         A.GaussianBlur(blur_limit=(3, 5), p=0.2),
         A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.3),
-        coarse_dropout,
     ])
 
     train_dataset = DATASET(train_x, train_y, size, transform=transform)
@@ -351,25 +352,19 @@ if __name__ == "__main__":
 
     print_and_save(train_log_path, f"Device: {device}\n")
 
-    model = build_doubleunet()
-    backbone_prefixes = (
-        "e1.xception",
-        "e1.dense_block2",
-        "e1.dense_block3",
-        "e1.vgg_block4",
-        "e1.vgg_block5",
-    )
-    for name, param in model.named_parameters():
-        if name.startswith(backbone_prefixes):
-            param.requires_grad = False
+    model = build_doubleunet(input_size=image_size)
 
-    # Same submodules as the freeze loop above (exact name match against
-    # backbone_prefixes), kept as module references so their BatchNorm layers
-    # can be pinned to eval mode every epoch - see the comment in train().
-    frozen_backbone_modules = [
-        module for name, module in model.named_modules()
-        if name in backbone_prefixes
-    ]
+    # Previously encoder1's DenseNet/VGG/Xception blocks were frozen permanently
+    # while e1.proj1 - a randomly initialised 1x1 conv sitting directly in front of
+    # them - stayed trainable. proj1 had to learn to produce something the frozen
+    # DenseNet already liked, with no way for DenseNet to meet it halfway. BUSI hit
+    # exactly this and fixed it in commits 9fa8edf / aee62b6; CBIS never got the
+    # port. Staged unfreezing replaces the permanent freeze:
+    #   phase 1  task layers only (decoders, ASPP, proj1, encoder2)
+    #   phase 2  + DenseNet and VGG blocks
+    #   phase 3  + Xception stem
+    phase_boundaries = [2, 8]
+    model.set_training_phase(1)
 
     total_params = sum(param.numel() for param in model.parameters())
     trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
@@ -384,35 +379,94 @@ if __name__ == "__main__":
         print(f"--- Removing old checkpoint {checkpoint_path} ---")
         os.remove(checkpoint_path)
 
-    optimizer = torch.optim.Adam(
-        (param for param in model.parameters() if param.requires_grad),
-        lr=lr,
-        weight_decay=weight_decay,
-    )
-    # Step on validation FOREGROUND F1 (the metric that still has headroom), not
-    # val_loss. val_loss plateaus early and noisily, which with the old
-    # (mode="min", patience=5, factor=0.1) config collapsed the LR to ~0 mid-run
-    # and froze training. mode="max" + higher patience + gentler factor keeps the
-    # LR alive while genuinely reducing it only on a real fg-F1 plateau.
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", patience=12, factor=0.5
-    )
+    def make_optimizer(prior=None):
+        groups = model.optimizer_parameter_groups(
+            task_lr=lr,
+            backbone_lr=lr * 0.1,
+            xception_lr=lr * 0.01,
+            task_weight_decay=weight_decay,
+            backbone_weight_decay=weight_decay * 0.1,
+        )
+        built = torch.optim.Adam(groups)
+        if prior is not None:
+            for parameter, state in prior.state.items():
+                if parameter.requires_grad:
+                    built.state[parameter] = state
+        return built
 
-    loss_fn = CombinedLoss(num_classes=NUM_CLASSES, class_weights=CBIS_CLASS_WEIGHTS)
-    loss_fn = loss_fn.to(device)
-    loss_name = "Weighted CrossEntropy + Foreground Multi-Class Dice Loss"
+    def make_scheduler(opt):
+        # Step on validation FOREGROUND F1 (the metric that still has headroom),
+        # not val_loss. val_loss plateaus early and noisily, which with the old
+        # (mode="min", patience=5, factor=0.1) config collapsed the LR to ~0
+        # mid-run and froze training.
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode="max", patience=12, factor=0.5
+        )
 
-    print_and_save(train_log_path, f"Optimizer: Adam\nLoss: {loss_name}\n")
-    print_and_save(train_log_path, f"CE class weights [bg, benign, malignant]: {CBIS_CLASS_WEIGHTS}\n")
+    optimizer = make_optimizer()
+    scheduler = make_scheduler(optimizer)
+
+    # Class weights derived from THIS split's mass-filtered training masks, at the
+    # resolution training actually consumes. The previous hardcoded
+    # [0.010, 1.0, 1.10] came from a 3-epoch smoke test on a pre-mass-filter
+    # dataset and no longer described the data being trained on.
+    class_pixel_counts = count_mask_class_pixels(train_y, size)
+    class_weights = compute_dynamic_class_weights(
+        class_pixel_counts, power=CLASS_WEIGHT_POWER, reference_class=1
+    )
+    loss_fn = DeepSupervisionLoss(
+        BUSIStageLoss(
+            num_classes=NUM_CLASSES,
+            class_weights=class_weights,
+            mode="control",
+        ),
+        # Same 0.4 : 1.0 emphasis as before, but normalized. The old form summed to
+        # 1.4, silently inflating the effective learning rate by 40% relative to
+        # BUSI and making the two pipelines' LRs incomparable.
+        p1_weight=0.4,
+        p2_weight=1.0,
+    ).to(device)
+    loss_name = "Weighted CrossEntropy + Foreground Multi-Class Dice (deep-supervised)"
+
+    print_and_save(train_log_path, f"Optimizer: Adam (discriminative LRs)\nLoss: {loss_name}\n")
+    print_and_save(
+        train_log_path,
+        f"Train mask pixels [bg, benign, malignant]: {class_pixel_counts}\n"
+        f"Derived CE class weights (power={CLASS_WEIGHT_POWER}): "
+        f"{[round(w, 5) for w in class_weights]}\n"
+        f"Staged unfreezing boundaries (epochs): {phase_boundaries}\n",
+    )
 
     best_valid_f1 = 0.0
     early_stopping_count = 0
 
+    current_phase = 1
     for epoch in range(num_epochs):
         start_time = time.time()
 
+        epoch_number = epoch + 1
+        if epoch_number <= phase_boundaries[0]:
+            phase = 1
+        elif epoch_number <= phase_boundaries[1]:
+            phase = 2
+        else:
+            phase = 3
+        if phase != current_phase:
+            model.set_training_phase(phase)
+            # Rebuild so the newly unfrozen tensors get their own LR group, keeping
+            # the Adam moments already accumulated for the task layers.
+            optimizer = make_optimizer(prior=optimizer)
+            scheduler = make_scheduler(optimizer)
+            current_phase = phase
+            print_and_save(
+                train_log_path,
+                f"--- Entering phase {phase} at epoch {epoch_number}: "
+                f"trainable="
+                f"{sum(p.numel() for p in model.parameters() if p.requires_grad):,} ---\n",
+            )
+
         train_loss, train_bg, train_fg = train(
-            model, train_loader, optimizer, loss_fn, device, scaler, frozen_backbone_modules
+            model, train_loader, optimizer, loss_fn, device, scaler
         )
         valid_loss, valid_bg, valid_fg = evaluate(model, valid_loader, loss_fn, device)
 
@@ -436,7 +490,13 @@ if __name__ == "__main__":
 
         epoch_mins, epoch_secs = epoch_time(start_time, time.time())
 
-        data_str = f"Epoch: {epoch + 1:02} | Epoch Time: {epoch_mins}m {epoch_secs}s | LR: {lr_before:.2e}\n"
+        # Explicit fit-regime signal: a large positive gap is overfitting, a gap
+        # near zero with a low validation score is underfitting.
+        fg_f1_gap = train_fg[1] - valid_fg[1]
+        data_str = (
+            f"Epoch: {epoch + 1:02} | Epoch Time: {epoch_mins}m {epoch_secs}s | "
+            f"LR: {lr_before:.2e} | phase: {phase} | fg-F1 gap: {fg_f1_gap:+.4f}\n"
+        )
         data_str += (
             f"\tTrain Loss: {train_loss:.4f}\n"
             f"\t  [fg]  Jaccard: {train_fg[0]:.4f} - F1: {train_fg[1]:.4f} - "

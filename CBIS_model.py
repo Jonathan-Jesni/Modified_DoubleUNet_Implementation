@@ -4,6 +4,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import vgg19, densenet121
 
+# BUSI_model.py holds the canonical implementations of the shared encoder and ASPP
+# pieces. Importing rather than duplicating them is deliberate: the two pipelines
+# previously drifted apart, and a fix applied to one (the encoder1 unfreeze, the
+# Xception stem) sat un-ported in the other for a month.
+from BUSI_model import (
+    ASPP,
+    LEGACY_ASPP_RATES,
+    StagedFineTuningMixin,
+    _XceptionStemFeatures,
+    aspp_rates_for,
+)
+
 
 NUM_CLASSES = 3
 
@@ -60,37 +72,6 @@ class squeeze_excitation_block(nn.Module):
         return x * y.expand_as(x)
 
 
-class ASPP(nn.Module):
-    def __init__(self, in_c, out_c):
-        super().__init__()
-
-        self.avgpool = nn.Sequential(
-            nn.AdaptiveAvgPool2d((2, 2)),
-            Conv2D(in_c, out_c, kernel_size=1, padding=0)
-        )
-
-        self.c1 = Conv2D(in_c, out_c, kernel_size=1, padding=0, dilation=1)
-        self.c2 = Conv2D(in_c, out_c, kernel_size=3, padding=6, dilation=6)
-        self.c3 = Conv2D(in_c, out_c, kernel_size=3, padding=12, dilation=12)
-        self.c4 = Conv2D(in_c, out_c, kernel_size=3, padding=18, dilation=18)
-
-        self.c5 = Conv2D(out_c * 5, out_c, kernel_size=1, padding=0, dilation=1)
-
-    def forward(self, x):
-        x0 = self.avgpool(x)
-        x0 = F.interpolate(x0, size=x.size()[2:], mode="bilinear", align_corners=True)
-
-        x1 = self.c1(x)
-        x2 = self.c2(x)
-        x3 = self.c3(x)
-        x4 = self.c4(x)
-
-        xc = torch.cat([x0, x1, x2, x3, x4], dim=1)
-        y = self.c5(xc)
-
-        return y
-
-
 class conv_block(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
@@ -114,10 +95,12 @@ class encoder1(nn.Module):
         vgg = vgg19(weights="DEFAULT").features
         densenet = densenet121(weights="DEFAULT").features
 
-        self.xception = timm.create_model(
-            "legacy_xception",
-            pretrained=True,
-            features_only=True
+        # Only the Xception stem's output (features[0]) is ever consumed, but
+        # features_only=True instantiated and ran the whole network: 20,806,952
+        # parameters and a full forward pass discarded every step. Retaining just
+        # the stem is mathematically identical and removes both costs.
+        self.xception = _XceptionStemFeatures(
+            timm.create_model("legacy_xception", pretrained=True)
         )
 
         self.proj1 = nn.Conv2d(64, 64, kernel_size=1)
@@ -251,19 +234,48 @@ class decoder2(nn.Module):
         return x
 
 
-class build_doubleunet(nn.Module):
-    def __init__(self, num_classes=NUM_CLASSES):
+class build_doubleunet(StagedFineTuningMixin, nn.Module):
+    def __init__(
+        self,
+        num_classes=NUM_CLASSES,
+        input_size=512,
+        aspp_rates="auto",
+        aspp_pool=1,
+        bn_policy="targeted",
+    ):
         super().__init__()
 
         self.num_classes = num_classes
+        self.input_size = int(input_size)
+        # Staged unfreezing state consumed by StagedFineTuningMixin. Phase 3 is the
+        # fully-unfrozen default; train_CBIS.py drives the schedule from epoch 1.
+        self.training_phase = 3
+        self.bn_policy = bn_policy
+
+        # Both ASPP blocks run on input_size // 16 (32x32 at the CBIS default).
+        self.aspp_feature_size = self.input_size // 16
+        self.aspp_pool = int(aspp_pool)
+        if isinstance(aspp_rates, str):
+            if aspp_rates == "auto":
+                resolved_rates = aspp_rates_for(self.aspp_feature_size)
+            elif aspp_rates == "legacy":
+                resolved_rates = LEGACY_ASPP_RATES
+            else:
+                raise ValueError(
+                    f"Unsupported aspp_rates {aspp_rates!r}; expected 'auto', "
+                    "'legacy', or three explicit dilations"
+                )
+        else:
+            resolved_rates = tuple(int(rate) for rate in aspp_rates)
+        self.aspp_rates = resolved_rates
 
         self.e1 = encoder1()
-        self.a1 = ASPP(512, 64)
+        self.a1 = ASPP(512, 64, rates=resolved_rates, pool_size=self.aspp_pool)
         self.d1 = decoder1()
         self.y1 = nn.Conv2d(32, num_classes, kernel_size=1, padding=0)
 
         self.e2 = encoder2()
-        self.a2 = ASPP(256, 64)
+        self.a2 = ASPP(256, 64, rates=resolved_rates, pool_size=self.aspp_pool)
         self.d2 = decoder2()
         self.y2 = nn.Conv2d(32, num_classes, kernel_size=1, padding=0)
 
