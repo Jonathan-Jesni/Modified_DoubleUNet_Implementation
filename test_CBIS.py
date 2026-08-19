@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from BUSI_model import predict_probabilities
 from CBIS_model import build_doubleunet
 from utils import create_dir, seeding, calculate_foreground_metrics
 
@@ -185,14 +186,14 @@ def evaluate(model, save_path, test_x, test_y, size, device):
         with torch.no_grad():
             start_time = time.time()
 
-            y_pred1, y_pred2 = model(image_tensor)
-            _ = 0.4 * y_pred1 + 1.0 * y_pred2
+            # CBIS_TTA=1 enables horizontal-flip test-time averaging. Off by
+            # default so it stays a screenable single variable.
+            y_pred1, y_pred2 = predict_probabilities(
+                model, image_tensor, tta=os.environ.get("CBIS_TTA") == "1"
+            )
 
             end_time = time.time() - start_time
             time_taken.append(end_time)
-
-            y_pred1 = torch.softmax(y_pred1, dim=1)
-            y_pred2 = torch.softmax(y_pred2, dim=1)
 
             y_pred1_classes = torch.argmax(y_pred1, dim=1)[0]
             y_pred2_classes = torch.argmax(y_pred2, dim=1)[0]

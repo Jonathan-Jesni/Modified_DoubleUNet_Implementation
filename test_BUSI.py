@@ -11,7 +11,11 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from BUSI_model import build_doubleunet, configure_screening_architecture
+from BUSI_model import (
+    build_doubleunet,
+    configure_screening_architecture,
+    predict_probabilities,
+)
 from busi_evaluation import (
     apply_foreground_threshold,
     evaluate_probabilities,
@@ -126,14 +130,17 @@ def _collect(
         pin_memory=device.type == "cuda",
         worker_init_fn=worker_seed_init,
     )
+    # Test-time augmentation must match what training was scored with, so it is
+    # read from the run's own resolved config rather than defaulted here.
+    use_tta = bool(config.get("evaluation", {}).get("tta", False))
     p1_values, p2_values, targets = [], [], []
     class_ids, sample_ids, lesion_quartiles = [], [], []
     with torch.inference_mode():
         for images, masks, metadata in loader:
             images = images.to(device, non_blocking=True)
-            p1_logits, p2_logits = model(images)
-            p1_values.append(torch.softmax(p1_logits, dim=1).cpu().numpy())
-            p2_values.append(torch.softmax(p2_logits, dim=1).cpu().numpy())
+            p1, p2 = predict_probabilities(model, images, tta=use_tta)
+            p1_values.append(p1.cpu().numpy())
+            p2_values.append(p2.cpu().numpy())
             targets.append(masks.numpy())
             class_ids.extend(int(value) for value in _metadata_values(metadata, "class_id"))
             sample_ids.extend(str(value) for value in _metadata_values(metadata, "sample_id"))
@@ -267,6 +274,9 @@ def main() -> None:
             bundle["targets"],
             class_ids=bundle["class_ids"],
             sample_ids=bundle["sample_ids"],
+            # Calibrate on whatever the run selected checkpoints with, so the
+            # threshold and the checkpoint are chosen under one rule.
+            metric=str(config.get("evaluation", {}).get("selection_metric", "S_bal")),
         )
         candidates.append(
             {
