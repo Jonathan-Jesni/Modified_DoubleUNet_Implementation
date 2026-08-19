@@ -831,7 +831,14 @@ def seed_everything(seed: int, deterministic: bool = True) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     if deterministic:
-        torch.use_deterministic_algorithms(True)
+        # warn_only=True is required, not a relaxation of intent. Segmentation
+        # cross entropy on [B, C, H, W] logits dispatches to nll_loss2d, which has
+        # no deterministic CUDA/HIP kernel; a strict True raises
+        # "nll_loss2d_forward_out_cuda_template does not have a deterministic
+        # implementation" on the first optimizer step, so the default config could
+        # not complete a single epoch on GPU. Every operation that does have a
+        # deterministic kernel still uses it; the rest warn instead of aborting.
+        torch.use_deterministic_algorithms(True, warn_only=True)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.allow_tf32 = False
