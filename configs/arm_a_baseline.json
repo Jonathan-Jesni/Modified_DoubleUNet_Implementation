@@ -1,0 +1,4 @@
+{
+  "_comment": "Arm A - baseline. Defaults as committed (Stage A repairs + B logging + C de-regularization). Everything else is measured against this. ema_decay is set because EMA is scored ALONGSIDE the raw weights each epoch, so it costs one extra calibration pass, not a whole arm.",
+  "training": {"max_epochs": 40, "minimum_epochs": 40, "ema_decay": 0.999}
+}

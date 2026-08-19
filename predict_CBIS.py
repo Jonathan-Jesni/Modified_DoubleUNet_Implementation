@@ -133,7 +133,10 @@ def main():
     print(f"[INFO] Using device: {device}")
 
     print("[INFO] Loading model...")
-    model = build_doubleunet()
+    # Pass the size explicitly: ASPP rates are derived from it, and the
+    # tensor shapes are identical either way, so a mismatch with training
+    # would load cleanly and silently compute different geometry.
+    model = build_doubleunet(input_size=IMAGE_SIZE[0])
     # Loading weights
     model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
     model.to(device)

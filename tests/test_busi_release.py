@@ -108,16 +108,27 @@ class BUSIReleaseTests(unittest.TestCase):
         phase_three = sum(p.numel() for p in model.parameters() if p.requires_grad)
         self.assertLess(phase_one, phase_three)
 
-    def test_tta_is_identity_for_symmetric_input(self):
+    def test_tta_averages_the_two_flip_views(self):
         torch.manual_seed(0)
         model = build_doubleunet(variant="v2", pretrained=False).eval()
         images = torch.randn(1, 3, 256, 256)
         with torch.no_grad():
             plain = predict_probabilities(model, images, tta=False)[1]
-            flipped = predict_probabilities(model, images, tta=True)[1]
-        # Averaging a view with its flip must preserve the probability simplex.
-        self.assertTrue(torch.allclose(flipped.sum(dim=1), torch.ones(1, 256, 256), atol=1e-5))
-        self.assertEqual(plain.shape, flipped.shape)
+            averaged = predict_probabilities(model, images, tta=True)[1]
+            # Recompute the mirrored view independently and check TTA is exactly
+            # the mean of the two. Convolutions are not flip-equivariant, so the
+            # two views genuinely differ - this is the property that makes the
+            # averaging worth doing, and the one worth pinning down.
+            mirrored = torch.flip(
+                torch.softmax(model(torch.flip(images, dims=(3,)))[1].float(), dim=1),
+                dims=(3,),
+            )
+        self.assertFalse(torch.allclose(plain, mirrored, atol=1e-4))
+        self.assertTrue(torch.allclose(averaged, 0.5 * (plain + mirrored), atol=1e-6))
+        # Averaging must leave the result a valid probability distribution.
+        self.assertTrue(
+            torch.allclose(averaged.sum(dim=1), torch.ones(1, 256, 256), atol=1e-5)
+        )
 
     @unittest.skipUnless(MANIFEST.is_file(), "canonical BUSI dataset not present")
     def test_frozen_dataset_and_regeneration_provenance(self):

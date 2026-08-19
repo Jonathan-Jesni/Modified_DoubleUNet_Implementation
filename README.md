@@ -80,8 +80,10 @@ bash scripts/sync_artifacts.sh once                    # test a single push firs
 bash scripts/sync_artifacts.sh loop &                  # then run unattended
 ```
 
-Checkpoints are too large for git (~341 MB full, ~114 MB `deploy.pt`). Pull
-`deploy.pt` manually before destroying the instance.
+Checkpoints are too large for git: a full checkpoint serialises to ~326 MB
+(model + Adam moments) and `deploy.pt` to ~109 MB, with up to ~1 GB written per
+epoch across `last.pt`, `best_primary.pt` and a candidate slot. Pull `deploy.pt`
+manually before destroying the instance.
 
 ## Reading the fit regime
 

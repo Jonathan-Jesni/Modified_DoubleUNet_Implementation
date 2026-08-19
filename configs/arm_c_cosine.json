@@ -1,0 +1,5 @@
+{
+  "_comment": "Arm C - cosine LR instead of plateau. Plateau steps on a score whose D_N term is a boolean over 12 normal images (~0.014 quantization vs 0.002 minimum_improvement), so its decisions are partly noise. Cosine never consults the metric. Single variable vs Arm A.",
+  "training": {"max_epochs": 40, "minimum_epochs": 40, "ema_decay": 0.999,
+               "scheduler": "cosine", "warmup_epochs": 3}
+}

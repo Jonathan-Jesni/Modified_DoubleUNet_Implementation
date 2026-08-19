@@ -1,0 +1,5 @@
+{
+  "_comment": "Arm B - no staged unfreezing. Prior runs suggest freezing hurt (0.4325 frozen vs 0.5716 unfrozen), but those are confounded by the 20.8M dead Xception that is now gone. Single variable vs Arm A.",
+  "training": {"max_epochs": 40, "minimum_epochs": 40, "ema_decay": 0.999},
+  "model": {"fine_tuning": {"staged_unfreezing": false}}
+}

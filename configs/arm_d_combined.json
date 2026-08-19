@@ -1,0 +1,6 @@
+{
+  "_comment": "Arm D - run ONLY if B and C each beat A. Combining two individually-winning changes is not guaranteed to win; this arm checks that rather than assuming it.",
+  "training": {"max_epochs": 40, "minimum_epochs": 40, "ema_decay": 0.999,
+               "scheduler": "cosine", "warmup_epochs": 3},
+  "model": {"fine_tuning": {"staged_unfreezing": false}}
+}

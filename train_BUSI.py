@@ -141,9 +141,33 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _reject_unknown_overrides(supplied: Mapping[str, Any], reference: Mapping[str, Any], path: str = "") -> None:
+    """Fail loudly on config keys that do not exist in DEFAULT_CONFIG.
+
+    deep_update merges anything, so a typo ("scheduler_type" for "scheduler")
+    would silently produce a second copy of the baseline. When arms differ by one
+    variable, that reads as "the change had no effect" - the most expensive kind
+    of quiet failure in a screening ladder.
+    """
+
+    for key, value in supplied.items():
+        if key.startswith("_"):  # "_comment" and friends are documentation
+            continue
+        location = f"{path}.{key}" if path else key
+        if key not in reference:
+            known = ", ".join(sorted(k for k in reference if not k.startswith("_")))
+            raise ValueError(
+                f"Unknown config key {location!r}. Known keys here: {known}"
+            )
+        if isinstance(value, Mapping) and isinstance(reference[key], Mapping):
+            _reject_unknown_overrides(value, reference[key], location)
+
+
 def resolve_config(path: str | None, variant: str, outer_fold: int, seed: int) -> dict[str, Any]:
     supplied = load_json(path) if path else {}
+    _reject_unknown_overrides(supplied, DEFAULT_CONFIG)
     config = deep_update(DEFAULT_CONFIG, supplied)
+    config.pop("_comment", None)
     config.update({"variant": variant, "outer_fold": int(outer_fold), "seed": int(seed)})
     profile = canonical_profile(
         config["dataset"]["preprocessing_profile"], config["dataset"].get("input_size")
@@ -640,11 +664,19 @@ def validate_resume_artifacts(
         candidate_payload = torch.load(
             candidate_path, map_location="cpu", weights_only=False
         )
+        # Candidates are ranked by the run's configured selection metric, so the
+        # cross-check has to read that same key. Reading "S_bal" unconditionally
+        # would refuse every resume of a run using selection_metric=S_bal_soft.
+        candidate_row = candidate_payload.get("epoch_log_row", {})
+        candidate_metric = str(
+            candidate_row.get("selection_metric")
+            or config.get("evaluation", {}).get("selection_metric", "S_bal")
+        )
         candidate_score = (
-            candidate_payload.get("epoch_log_row", {})
+            candidate_row
             .get("calibration_fixed_0_50", {})
             .get("p2", {})
-            .get("S_bal")
+            .get(candidate_metric)
         )
         if (
             candidate_payload.get("run_id") != run_dir.name
@@ -985,6 +1017,12 @@ def main() -> None:
             model.set_training_phase(phase)
             optimizer = make_optimizer(model, config, prior=optimizer)
             scheduler = make_scheduler(optimizer, config)
+            if not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                # Rebuilding restarts a schedule-driven scheduler at epoch 0. Left
+                # alone the cosine would jump back to peak at every phase boundary
+                # and never finish its decay inside max_epochs.
+                for _ in range(epoch - 1):
+                    scheduler.step()
             current_phase = phase
             phase_start_payload = checkpoint_contract(
                 config,
@@ -1060,8 +1098,6 @@ def main() -> None:
             score = float(selected)
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 scheduler.step(score)
-            else:
-                scheduler.step()
             is_best = score > best_score
             if is_best:
                 best_score = score
@@ -1115,6 +1151,15 @@ def main() -> None:
                 "probe_sample_count": train_probe["p2"]["sample_count"],
             }
 
+        epoch_learning_rates = {
+            group.get("name", str(index)): group["lr"]
+            for index, group in enumerate(optimizer.param_groups)
+        }
+        if not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            # Schedule-driven: steps every epoch, including all-development runs
+            # that have no calibration split to plateau on.
+            scheduler.step()
+
         elapsed = time.perf_counter() - start
         resources = {
             "samples_per_second": len(train_dataset) / max(elapsed, 1e-12),
@@ -1143,10 +1188,7 @@ def main() -> None:
             "selection_metric": selection_metric,
             "training_state": post_train_state,
             "resources": resources,
-            "learning_rates": {
-                group.get("name", str(index)): group["lr"]
-                for index, group in enumerate(optimizer.param_groups)
-            },
+            "learning_rates": epoch_learning_rates,
         }
         candidate_path = _safe_candidate_slot(run_dir, candidates) if enters_top_three else None
         prospective_candidates = (
@@ -1227,9 +1269,14 @@ def main() -> None:
     atomic_json_dump(
         {
             "status": "complete",
+            "selection_metric": str(
+                config.get("evaluation", {}).get("selection_metric", "S_bal")
+            ),
             "last_epoch": int(last_checkpoint["epoch"]),
             "deployment_epoch": int(final_checkpoint["epoch"]),
-            "best_fixed_threshold_S_bal": (
+            # Named for the fixed threshold it was measured at; the metric itself
+            # is whichever "selection_metric" above names.
+            "best_fixed_threshold_score": (
                 float(last_checkpoint["best_score"])
                 if math.isfinite(float(last_checkpoint["best_score"]))
                 else None

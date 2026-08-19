@@ -290,7 +290,10 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Device: {device}")
 
-    model = build_doubleunet()
+    # Pass the size explicitly: ASPP rates are derived from it, and the
+    # tensor shapes are identical either way, so a mismatch with training
+    # would load cleanly and silently compute different geometry.
+    model = build_doubleunet(input_size=SIZE[0])
     model = model.to(device)
 
     print_model_parameters(model)
