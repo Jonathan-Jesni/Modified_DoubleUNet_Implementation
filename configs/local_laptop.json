@@ -5,7 +5,7 @@
     "num_workers": 0,
     "max_epochs": 40,
     "minimum_epochs": 40,
-    "train_probe_size": 48,
+    "train_probe_size": 96,
     "ema_decay": 0.999
   }
 }
