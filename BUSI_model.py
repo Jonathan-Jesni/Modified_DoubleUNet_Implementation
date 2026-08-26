@@ -708,14 +708,19 @@ class WeightEMA:
             for name, value in model.state_dict().items()
             if value.dtype.is_floating_point
         }
+        # Fixed order so the batched update below pairs shadows with sources.
+        self._keys = list(self.shadow)
 
     @torch.no_grad()
     def update(self, model):
-        for name, value in model.state_dict().items():
-            if name in self.shadow:
-                self.shadow[name].mul_(self.decay).add_(
-                    value.detach().float(), alpha=1.0 - self.decay
-                )
+        # Batched via _foreach_*: a per-tensor loop issued two kernel launches for
+        # each of ~500 tensors on every optimizer step. These collapse that into a
+        # couple of launches. Both are elementwise, so determinism is unaffected.
+        state = model.state_dict()
+        shadows = [self.shadow[name] for name in self._keys]
+        sources = [state[name].detach().float() for name in self._keys]
+        torch._foreach_mul_(shadows, self.decay)
+        torch._foreach_add_(shadows, sources, alpha=1.0 - self.decay)
 
     def state_dict(self):
         return {name: value.clone() for name, value in self.shadow.items()}

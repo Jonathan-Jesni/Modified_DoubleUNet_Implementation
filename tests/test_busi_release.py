@@ -6,12 +6,13 @@ import unittest
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 from BUSI_model import aspp_rates_for, build_doubleunet, predict_probabilities
 from CBIS_model import build_doubleunet as cbis_build_doubleunet
 from busi_dataset import _prior_membership
 from busi_runtime import validate_dataset_contract, verify_generated_artifacts
-from metrics import BUSIStageLoss, DeepSupervisionLoss
+from metrics import BUSIStageLoss, DeepSupervisionLoss, DeterministicCrossEntropy2d
 from prepare_busi_dataset import resolve_review_csv
 from train_BUSI import resolve_config
 
@@ -93,6 +94,41 @@ class BUSIReleaseTests(unittest.TestCase):
         p1, p2 = model(torch.randn(1, 3, 256, 256))
         self.assertEqual(tuple(p1.shape), (1, 3, 256, 256))
         self.assertEqual(tuple(p2.shape), (1, 3, 256, 256))
+
+    def test_cross_entropy_matches_torch_and_is_deterministic(self):
+        # nn.CrossEntropyLoss on [B,C,H,W] dispatches to nll_loss2d, whose backward
+        # uses atomics. At batch 2 the contention is low enough that it happens to
+        # be stable, but at the batch 8 both pipelines actually train with, repeated
+        # backward passes over identical inputs disagree in the last few bits.
+        # seed_everything already trades away TF32 and cuDNN autotuning to buy
+        # reproducibility, so one non-deterministic op meant paying that cost and
+        # not receiving the guarantee.
+        weights = [0.109, 1.0, 0.959]
+        reference = nn.CrossEntropyLoss(weight=torch.tensor(weights))
+        candidate = DeterministicCrossEntropy2d(3, weight=weights)
+
+        torch.manual_seed(0)
+        logits = torch.randn(4, 3, 64, 64, requires_grad=True)
+        targets = torch.randint(0, 3, (4, 64, 64))
+        expected = reference(logits, targets)
+        expected_grad, = torch.autograd.grad(expected, logits)
+
+        other = logits.detach().clone().requires_grad_(True)
+        actual = candidate(other, targets)
+        actual_grad, = torch.autograd.grad(actual, other)
+
+        self.assertAlmostEqual(expected.item(), actual.item(), places=5)
+        self.assertTrue(torch.allclose(expected_grad, actual_grad, atol=1e-7))
+
+        def gradient():
+            torch.manual_seed(1)
+            values = torch.randn(8, 3, 128, 128, requires_grad=True)
+            labels = torch.randint(0, 3, (8, 128, 128))
+            return torch.autograd.grad(candidate(values, labels), values)[0]
+
+        runs = [gradient() for _ in range(4)]
+        for run in runs[1:]:
+            self.assertTrue(torch.equal(runs[0], run), "loss gradient is not bit-exact")
 
     def test_cbis_carries_no_dead_xception(self):
         # Regression: features_only=True instantiated the whole Xception (20,806,952

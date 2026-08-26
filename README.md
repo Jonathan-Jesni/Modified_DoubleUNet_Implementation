@@ -98,6 +98,27 @@ Read both numbers, never the gap alone: in earlier runs the gap shrank from 0.28
 to 0.11 while validation got *worse*, which is regularization removing useful
 capacity rather than curbing memorization.
 
+## Reproducibility
+
+`"deterministic": true` (the default) gives up TF32 and cuDNN autotuning — roughly
+a 5x slowdown on NVIDIA — to buy bit-exact reproducibility and bit-exact `--resume`.
+
+That guarantee was previously incomplete: `nn.CrossEntropyLoss` on `[B, C, H, W]`
+logits dispatches to `nll_loss2d`, whose backward uses atomics and has no
+deterministic CUDA/HIP kernel. Measured on an RTX 5050, repeated backward passes
+over identical inputs disagreed by ~2e-13 at batch 8 (both pipelines' training
+batch size) while happening to agree at batch 2. `DeterministicCrossEntropy2d` in
+`metrics.py` replaces it with `log_softmax` + one-hot masking, which is
+numerically identical and bit-exact. `gather` is deliberately avoided: its
+backward is a scatter-add, non-deterministic in the same way.
+
+To confirm reproducibility on a new machine, run the same seed twice and compare
+everything except the timing fields:
+
+```bash
+python -c "import json;print([{k:v for k,v in r.items() if k not in ('elapsed_seconds','resources')} for r in map(json.loads, open('runs/A/training.jsonl'))] == [{k:v for k,v in r.items() if k not in ('elapsed_seconds','resources')} for r in map(json.loads, open('runs/B/training.jsonl'))])"
+```
+
 ## Screening flags
 
 All default to off so the baseline arm stays clean. Change one at a time — a

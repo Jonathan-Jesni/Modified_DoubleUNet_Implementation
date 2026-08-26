@@ -1,0 +1,11 @@
+{
+  "_comment": "Local laptop run (RTX 5050 Laptop, 8 GB). NOT a substitute for the ROCm run: batch_size 2 changes BatchNorm statistics, so scores from this config are not comparable to a batch-8 cloud run. Use it to prove the pipeline runs end to end, not to decide anything. Measured on this GPU: batch 1 = 2.48 GB / 0.14 s per step, batch 2 = 4.61 GB / 0.30 s, batch 3 = 6.75 GB / 1.93 s, batch 4 = 8.88 GB / 9.76 s - past batch 2 it spills out of VRAM into shared system RAM and falls off a cliff.",
+  "training": {
+    "batch_size": 2,
+    "num_workers": 0,
+    "max_epochs": 40,
+    "minimum_epochs": 40,
+    "train_probe_size": 48,
+    "ema_decay": 0.999
+  }
+}

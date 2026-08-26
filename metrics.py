@@ -67,6 +67,51 @@ class MultiClassDiceLoss(nn.Module):
 
         return 1.0 - dice_score.mean()
 
+class DeterministicCrossEntropy2d(nn.Module):
+    """Weighted cross entropy for [B, C, H, W] logits, using deterministic kernels.
+
+    Drop-in replacement for ``nn.CrossEntropyLoss(weight=...)`` at reduction
+    "mean", including its weighted-mean convention: the denominator is the sum of
+    the per-pixel class weights, not the pixel count.
+
+    Why this exists: ``nn.CrossEntropyLoss`` on 2-D logits dispatches to
+    ``nll_loss2d``, which has no deterministic CUDA/HIP kernel. Under
+    ``torch.use_deterministic_algorithms(True)`` that raises outright; under
+    ``warn_only=True`` it silently makes the whole run non-reproducible. Since
+    seed_everything already gives up TF32 and cuDNN autotuning to buy
+    reproducibility, leaving one non-deterministic op in the loss meant paying
+    that cost without receiving the guarantee.
+
+    ``gather`` is deliberately avoided: its backward is a scatter-add, which uses
+    atomics and is non-deterministic in exactly the same way. One-hot masking
+    costs a [B, C, H, W] temporary but has an elementwise backward.
+    """
+
+    def __init__(self, num_classes=3, weight=None):
+        super().__init__()
+        self.num_classes = int(num_classes)
+        if weight is None:
+            self.register_buffer("weight", None)
+        else:
+            weight = torch.as_tensor(weight, dtype=torch.float32)
+            if weight.numel() != self.num_classes:
+                raise ValueError("weight length must equal num_classes")
+            # A buffer, so .to(device) moves it exactly as _WeightedLoss would.
+            self.register_buffer("weight", weight)
+
+    def forward(self, inputs, targets):
+        log_probabilities = F.log_softmax(inputs, dim=1)
+        target_one_hot = F.one_hot(targets.long(), num_classes=self.num_classes)
+        target_one_hot = target_one_hot.permute(0, 3, 1, 2).to(log_probabilities.dtype)
+        per_pixel = -(log_probabilities * target_one_hot).sum(dim=1)
+
+        if self.weight is None:
+            return per_pixel.mean()
+        # Indexing a buffer that needs no gradient: forward-only, deterministic.
+        pixel_weights = self.weight.to(per_pixel.dtype)[targets.long()]
+        return (per_pixel * pixel_weights).sum() / pixel_weights.sum().clamp_min(1e-12)
+
+
 class BinaryForegroundOverlapLoss(nn.Module):
     """Binary foreground Dice or Tversky loss for lesion-positive samples.
 
@@ -189,7 +234,7 @@ class BUSIStageLoss(nn.Module):
         weight = None if class_weights is None else torch.as_tensor(class_weights, dtype=torch.float32)
         if weight is not None and weight.numel() != num_classes:
             raise ValueError("class_weights length must equal num_classes")
-        self.ce = nn.CrossEntropyLoss(weight=weight)
+        self.ce = DeterministicCrossEntropy2d(num_classes=num_classes, weight=weight)
         self.control_dice = MultiClassDiceLoss(
             num_classes=num_classes,
             smooth=smooth,
